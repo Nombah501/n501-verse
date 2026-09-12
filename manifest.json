@@ -1,0 +1,76 @@
+{
+  "schemaVersion": 1,
+  "id": "n501.karaoke",
+  "name": "N501 Verse",
+  "version": "0.3.0",
+  "author": "n501",
+  "description": "Synchronized lyrics that stay with your music.",
+  "license": "MIT",
+  "kinds": ["service", "bar-widget"],
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "N501 Verse",
+    "description": "Shows synchronized lyrics for the active media player.",
+    "category": "Media",
+    "allowMultiple": false,
+    "defaultSection": "left",
+    "defaults": {
+      "layoutMode": "Standard",
+      "networkMode": "Auto",
+      "neteaseEnabled": true,
+      "lrclibEnabled": true,
+      "kugouEnabled": true,
+      "showTranslations": "On"
+    },
+    "schema": [
+      {
+        "key": "layoutMode",
+        "type": "enum",
+        "label": "Bar size",
+        "options": ["Compact", "Standard", "Expanded"],
+        "description": "Compact uses 320 px, Standard 520 px, Expanded 720 px for the bar lyric slot.",
+        "defaultValue": "Standard"
+      },
+      {
+        "key": "networkMode",
+        "type": "enum",
+        "label": "Network",
+        "options": ["Auto", "Offline"],
+        "description": "Auto performs provider lookups. Offline permits local files and existing shared-cache hits but performs no provider request.",
+        "defaultValue": "Auto"
+      },
+      {
+        "key": "neteaseEnabled",
+        "type": "boolean",
+        "label": "Netease",
+        "description": "Netease community source (experimental; word timing depends on availability, with no guarantee of availability, rights, or timing).",
+        "defaultValue": true
+      },
+      {
+        "key": "lrclibEnabled",
+        "type": "boolean",
+        "label": "LRCLIB",
+        "description": "LRCLIB free community source (ordinary results are line-timed, with no guarantee of availability, rights, or timing).",
+        "defaultValue": true
+      },
+      {
+        "key": "kugouEnabled",
+        "type": "boolean",
+        "label": "Kugou",
+        "description": "Kugou community source (experimental; word timing depends on availability, with no guarantee of availability, rights, or timing).",
+        "defaultValue": true
+      },
+      {
+        "key": "showTranslations",
+        "type": "enum",
+        "label": "Translations",
+        "options": ["On", "Off"],
+        "description": "Show translated lyric lines when the provider supplies them.",
+        "defaultValue": "On"
+      }
+    ]
+  }
+}

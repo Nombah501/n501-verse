@@ -1,0 +1,2036 @@
+#!/usr/bin/python3
+"""Fetch one synchronized lyric document through the installed Kotonoha stack."""
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import math
+import os
+import stat
+import sys
+import time
+import urllib.parse
+from pathlib import Path
+from typing import Any, Iterable
+
+try:
+    from kotonoha.lyrics.http import new_lyrics_session
+    from kotonoha.lyrics.artist_grammar import performing_artist
+    from kotonoha.lyrics.match import MatchConfidence, TrackMetadata
+    from kotonoha.lyrics.player_title_grammar import clean_player_title
+    from kotonoha.lyrics.title_grammar import recover_artist
+    from kotonoha.lyrics.netease import fetch_artifact as fetch_netease
+    from kotonoha.lyrics.netease import parse_payload as parse_netease
+    from kotonoha.lyrics.lrclib import fetch_artifact as fetch_lrclib
+    from kotonoha.lyrics.lrclib import parse_payload as parse_lrclib
+    from kotonoha.lyrics.kugou import fetch_artifact as fetch_kugou
+    from kotonoha.lyrics.kugou import parse_payload as parse_kugou
+    from kotonoha.lyrics.cache.models import LyricsCacheMode, LyricsCacheKey
+    from kotonoha.lyrics.cache.storage import LyricsCacheStorage, cache_path
+except (ImportError, ModuleNotFoundError) as exc:  # pragma: no cover - machine dependent
+    IMPORT_ERROR = exc
+else:
+    IMPORT_ERROR = None
+
+try:  # Optional local-file capability; never gates core fetch.
+    from kotonoha.lyrics.hint import from_player as _hint_from_player
+    from kotonoha.lyrics.local import load_local_lyrics as _load_local_lyrics
+    from kotonoha.lyrics.artifact import LyricsArtifact as _LyricsArtifact
+except (ImportError, ModuleNotFoundError, AttributeError):  # pragma: no cover - machine dependent
+    _hint_from_player = None
+    _load_local_lyrics = None
+    _LyricsArtifact = None
+LOCAL_AVAILABLE = (
+    _hint_from_player is not None and _load_local_lyrics is not None and _LyricsArtifact is not None
+)
+
+try:  # Optional match-evidence capability; never gates core fetch.
+    from kotonoha.lyrics.match import Candidate as _Candidate
+    from kotonoha.lyrics.match import evaluate_match as _evaluate_match
+except (ImportError, ModuleNotFoundError, AttributeError):
+    _Candidate = None
+    _evaluate_match = None
+MATCH_EVIDENCE_AVAILABLE = _Candidate is not None and _evaluate_match is not None
+
+try:  # Optional per-provider search capability; never gates core fetch.
+    from kotonoha.lyrics.netease import search_artifacts as _search_netease
+except (ImportError, ModuleNotFoundError, AttributeError):  # pragma: no cover - machine dependent
+    _search_netease = None
+try:
+    from kotonoha.lyrics.lrclib import search_artifacts as _search_lrclib
+except (ImportError, ModuleNotFoundError, AttributeError):  # pragma: no cover - machine dependent
+    _search_lrclib = None
+try:
+    from kotonoha.lyrics.kugou import search_artifacts as _search_kugou
+except (ImportError, ModuleNotFoundError, AttributeError):  # pragma: no cover - machine dependent
+    _search_kugou = None
+_SEARCH_AVAILABLE = {
+    "netease": _search_netease is not None,
+    "lrclib": _search_lrclib is not None,
+    "kugou": _search_kugou is not None,
+}
+try:  # Optional timing-offset capability; never gates core fetch.
+    from kotonoha.display.offsets import track_offset_key as _track_offset_key
+    from kotonoha.display.offsets import clamp_track_offset as _clamp_track_offset
+    from kotonoha.display.offsets import TrackIdentity as _TrackIdentity
+    from kotonoha.display.offsets import TrackOffsetKey as _TrackOffsetKey
+    from kotonoha.display.offsets import TrackOffsetEntry as _TrackOffsetEntry
+    from kotonoha.lyrics.adapter import LyricsDocumentAdapter as _LyricsDocumentAdapter
+    from kotonoha.state.track_offset_store import TrackOffsetStore as _TrackOffsetStore
+except (ImportError, ModuleNotFoundError, AttributeError):  # pragma: no cover - machine dependent
+    _track_offset_key = None
+    _clamp_track_offset = None
+    _TrackIdentity = None
+    _TrackOffsetKey = None
+    _TrackOffsetEntry = None
+    _LyricsDocumentAdapter = None
+    _TrackOffsetStore = None
+OFFSET_AVAILABLE = (
+    _track_offset_key is not None and _clamp_track_offset is not None
+    and _TrackIdentity is not None and _TrackOffsetKey is not None
+    and _TrackOffsetEntry is not None and _LyricsDocumentAdapter is not None
+    and _TrackOffsetStore is not None
+)
+
+SCHEMA_VERSION = 1
+MAX_OUTPUT_BYTES = 4 * 1024 * 1024
+PROVIDER_ORDER = ("netease", "lrclib", "kugou")
+PROVIDER_SUB_BUDGET_S = 8.0
+OVERALL_DEADLINE_S = 25.0
+MAX_WARNING_ITEMS = 8
+MAX_WARNING_CHARS = 64
+MAX_VERSION_CHARS = 64
+MAX_FIELD_CHARS = 256
+MAX_ATTEMPT_ITEMS = 3
+ALIAS_MAX_ROWS = 1000
+ALIAS_SCHEMA_VERSION = 1
+ALIAS_DIR_MODE = 0o700
+ALIAS_DB_MODE = 0o600
+OFFSET_MS_MIN = -10000
+OFFSET_MS_MAX = 10000
+
+
+def _providers() -> list[tuple[str, Any, Any]]:
+    if IMPORT_ERROR is not None:
+        return []
+    return [
+        ("netease", fetch_netease, parse_netease),
+        ("lrclib", fetch_lrclib, parse_lrclib),
+        ("kugou", fetch_kugou, parse_kugou),
+    ]
+
+
+class InvalidPayload(ValueError):
+    pass
+
+
+def _finite(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(float(value))
+
+
+def _confidence_value(value: Any) -> str:
+    raw = getattr(value, "value", value)
+    return str(raw or "").lower()
+
+
+def _confidence_rank(value: Any) -> int:
+    return {"none": 0, "medium": 1, "high": 2}.get(_confidence_value(value), 0)
+
+
+def _line_is_word_timed(line: Any) -> bool:
+    words = list(getattr(line, "words", ()) or ())
+    if not words:
+        return False
+    texts: list[str] = []
+    saw_timed = False
+    has_timed = False
+    for word in words:
+        text = getattr(word, "text", None)
+        if not isinstance(text, str):
+            return False
+        start = getattr(word, "start", None)
+        end = getattr(word, "end", None)
+        if start is None and end is None:
+            if saw_timed:
+                return False
+            texts.append(text)
+            continue
+        if not _finite(start) or not _finite(end):
+            return False
+        saw_timed = True
+        has_timed = True
+        texts.append(text)
+    if not has_timed:
+        return False
+    return "".join(texts) == getattr(line, "text", None)
+
+
+def _artifact_has_words(artifact: Any) -> bool:
+    return any(_line_is_word_timed(line) for line in getattr(artifact, "lines", ()) or ())
+
+
+def _artifact_is_fully_word_timed(artifact: Any) -> bool:
+    lines = list(getattr(artifact, "lines", ()) or ())
+    if not lines:
+        return False
+    return all(_line_is_word_timed(line) for line in lines)
+def _candidate_for_evidence(artifact: Any) -> Any:
+    existing = getattr(artifact, "candidate", None)
+    if existing is not None:
+        return existing
+    if _Candidate is None:
+        return None
+    try:
+        duration = getattr(artifact, "duration_s", None)
+        duration_f = (float(duration) if _finite(duration) and float(duration) > 0 else None)
+        return _Candidate(
+            song_id=str(getattr(artifact, "provider_song_id", "") or ""),
+            title=str(getattr(artifact, "title", "") or ""),
+            artist=str(getattr(artifact, "artist", "") or ""),
+            duration_s=duration_f,
+            album=str(getattr(artifact, "album", "") or ""),
+        )
+    except Exception:
+        return None
+
+
+def _duration_gap(artifact: Any, track: Any) -> float:
+    try:
+        want = getattr(track, "duration_s", None)
+        got = getattr(artifact, "duration_s", None)
+    except Exception:
+        return math.inf
+    if want is None or got is None:
+        return math.inf
+    try:
+        want_f = float(want)
+        got_f = float(got)
+    except (TypeError, ValueError):
+        return math.inf
+    if not math.isfinite(want_f) or not math.isfinite(got_f) or want_f <= 0 or got_f <= 0:
+        return math.inf
+    return abs(got_f - want_f)
+
+
+def _evidence_sort_key(artifact: Any, track: Any) -> tuple[Any, ...]:
+    candidate = _candidate_for_evidence(artifact)
+    if (not MATCH_EVIDENCE_AVAILABLE or candidate is None or track is None
+            or _evaluate_match is None):
+        return (0,)
+    try:
+        evidence = _evaluate_match(candidate, track, fuzzy=True)
+    except Exception:
+        return (0,)
+    if _confidence_value(getattr(evidence, "confidence", "none")) == "none":
+        # Never drop a provider-usable artifact on re-evaluation alone; pin it
+        # to the lowest evidence key so final status semantics do not change.
+        return (0,)
+    try:
+        similarity = float(getattr(evidence, "similarity_score", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        similarity = 0.0
+    if not math.isfinite(similarity):
+        similarity = 0.0
+    gap = _duration_gap(artifact, track)
+    return (1, _confidence_rank(getattr(evidence, "confidence", "none")),
+            similarity, -gap if math.isfinite(gap) else float("-inf"))
+
+
+def _ranked(artifacts: Iterable[Any], track: Any = None) -> list[Any]:
+    indexed = {name: index for index, name in enumerate(PROVIDER_ORDER)}
+    usable = [item for item in artifacts if _confidence_rank(getattr(item, "confidence", "none")) > 0]
+    if MATCH_EVIDENCE_AVAILABLE and track is not None:
+        keys: dict[int, tuple[Any, ...]] = {}
+        for item in usable:
+            try:
+                keys[id(item)] = _evidence_sort_key(item, track)
+            except Exception:
+                keys[id(item)] = (0,)
+        # Evidence tuple is (0,) for unevaluated/none or
+        # (1, conf_rank, similarity, neg_gap_or_-inf). Ascending key below
+        # orders: evaluated above unevaluated, higher confidence first, then
+        # higher similarity, then closest known duration, then word timing,
+        # then canonical provider order.
+        def evidence_key(item: Any) -> tuple[Any, ...]:
+            parts = keys[id(item)]
+            if len(parts) == 1:
+                return (0, 0, 0.0, math.inf)
+            gap = parts[3]
+            gap_value = -float(gap) if math.isfinite(float(gap)) else math.inf
+            return (parts[0], parts[1], float(parts[2]), gap_value)
+        usable.sort(
+            key=lambda item: (
+                -evidence_key(item)[0],
+                -evidence_key(item)[1],
+                -evidence_key(item)[2],
+                evidence_key(item)[3],
+                -int(_artifact_is_fully_word_timed(item)),
+                indexed.get(str(getattr(item, "provider", "")), len(indexed)),
+            )
+        )
+        return usable
+    usable.sort(
+        key=lambda item: (
+            -_confidence_rank(getattr(item, "confidence", "none")),
+            -int(_artifact_has_words(item)),
+            indexed.get(str(getattr(item, "provider", "")), len(indexed)),
+        )
+    )
+    return usable
+
+def _track_fields(track: Any) -> tuple[str, str, str, float | None]:
+    title = str(getattr(track, "title", "") or "")
+    artist = str(getattr(track, "artist", "") or "")
+    album = str(getattr(track, "album", "") or "")
+    duration = getattr(track, "duration_s", None)
+    if duration is not None:
+        duration = float(duration)
+    return title, artist, album, duration
+
+
+def _track_for_lookup(title: Any, artist: Any, album: Any, duration: float | None) -> Any:
+    reported_title = str(title or "")
+    reported_artist = performing_artist(str(artist or ""))
+    resolved_artist = recover_artist(reported_title, reported_artist)
+    cleaned_title = clean_player_title(reported_title, resolved_artist)
+    return TrackMetadata(cleaned_title, resolved_artist, str(album or ""), duration)
+
+
+def _bound_field(value: Any) -> str:
+    return str(value or "")[:MAX_FIELD_CHARS]
+
+
+def _sanitize_attempts(attempts: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    if not attempts:
+        return []
+    cleaned: list[dict[str, Any]] = []
+    for item in attempts:
+        if not isinstance(item, dict):
+            continue
+        provider = item.get("provider")
+        outcome = item.get("outcome")
+        if provider not in PROVIDER_ORDER:
+            continue
+        if outcome not in ("candidate", "not_found", "timeout", "error", "rejected"):
+            continue
+        cleaned.append({"provider": provider, "outcome": outcome})
+        if len(cleaned) >= MAX_ATTEMPT_ITEMS:
+            break
+    return cleaned
+
+
+def _sanitize_alias(alias: dict[str, Any] | None) -> dict[str, Any] | None:
+    if alias is None:
+        return None
+    if not isinstance(alias, dict):
+        return None
+    keys = ("queryTitle", "queryArtist", "queryAlbum", "provider", "songId",
+            "matchedTitle", "matchedArtist", "matchedAlbum")
+    cleaned = {}
+    for key in keys:
+        value = alias.get(key)
+        if not isinstance(value, str):
+            return None
+        cleaned[key] = value[:MAX_FIELD_CHARS]
+    if cleaned["provider"] not in PROVIDER_ORDER:
+        return None
+    if cleaned["songId"] == "":
+        return None
+    return cleaned
+
+
+def _response_base(request_id: int, track: Any) -> dict[str, Any]:
+    title, artist, album, duration = _track_fields(track)
+    return {
+        "schemaVersion": SCHEMA_VERSION,
+        "requestId": request_id,
+        "status": "not_found",
+        "provider": "",
+        "confidence": "none",
+        "timing": "none",
+        "title": _bound_field(title),
+        "artist": _bound_field(artist),
+        "album": _bound_field(album),
+        "duration": duration,
+        "lines": [],
+        "error": "",
+        "warnings": [],
+        "providerAttempts": [],
+        "savedAlias": None,
+    }
+
+def _provider_song_id(artifact: Any) -> str | None:
+    song_id = getattr(artifact, "provider_song_id", None)
+    if isinstance(song_id, str) and song_id != "":
+        return song_id[:256]
+    return None
+
+
+def _document_has_translation(lines: list[dict[str, Any]]) -> bool:
+    return any(isinstance(line.get("translation"), str) and line["translation"] != "" for line in lines)
+
+
+def _sanitize_warnings(warnings: list[str] | None) -> list[str]:
+    if not warnings:
+        return []
+    cleaned: list[str] = []
+    for item in warnings:
+        if not isinstance(item, str):
+            continue
+        cleaned.append(item[:MAX_WARNING_CHARS])
+        if len(cleaned) >= MAX_WARNING_ITEMS:
+            break
+    return cleaned
+
+
+def _error_response(request_id: int, track: Any, status: str, error: str,
+                    warnings: list[str] | None = None,
+                    provider_attempts: list[dict[str, Any]] | None = None,
+                    saved_alias: dict[str, Any] | None = None) -> dict[str, Any]:
+    response = _response_base(request_id, track)
+    response["status"] = status
+    response["error"] = error
+    cleaned = _sanitize_warnings(warnings)
+    if cleaned:
+        response["warnings"] = cleaned
+    response["providerAttempts"] = _sanitize_attempts(provider_attempts)
+    response["savedAlias"] = _sanitize_alias(saved_alias)
+    return response
+
+
+def _serialize_artifact(artifact: Any, request_id: int, track: Any, *,
+                        source_kind: str, cache_mode: str,
+                        warnings: list[str] | None = None,
+                        provider_attempts: list[dict[str, Any]] | None = None,
+                        saved_alias: dict[str, Any] | None = None) -> dict[str, Any]:
+    provider = str(getattr(artifact, "provider", "") or "")
+    if provider != "local" and provider not in PROVIDER_ORDER:
+        raise InvalidPayload("provider")
+    confidence = _confidence_value(getattr(artifact, "confidence", ""))
+    if confidence not in ("high", "medium"):
+        raise InvalidPayload("confidence")
+    raw_lines = getattr(artifact, "lines", None)
+    if not isinstance(raw_lines, (list, tuple)) or not raw_lines:
+        raise InvalidPayload("lines")
+
+    lines: list[dict[str, Any]] = []
+    previous_start = -math.inf
+    has_words = False
+    for source_line in raw_lines:
+        start = getattr(source_line, "start", None)
+        end = getattr(source_line, "end", None)
+        if not _finite(start) or not _finite(end) or float(start) < 0 or float(end) < float(start):
+            raise InvalidPayload("line_span")
+        if float(start) < previous_start:
+            raise InvalidPayload("line_order")
+        previous_start = float(start)
+        text = getattr(source_line, "text", "")
+        translation = getattr(source_line, "translation", "")
+        if not isinstance(text, str) or not isinstance(translation, str):
+            raise InvalidPayload("line_text")
+        serialized_words: list[dict[str, Any]] = []
+        raw_words = getattr(source_line, "words", ()) or ()
+        try:
+            iterator = iter(raw_words)
+        except TypeError as exc:
+            raise InvalidPayload("words") from exc
+        previous_word_start = -math.inf
+        saw_timed = False
+        for source_word in iterator:
+            word_start = getattr(source_word, "start", None)
+            word_end = getattr(source_word, "end", None)
+            word_text = getattr(source_word, "text", "")
+            if not isinstance(word_text, str):
+                raise InvalidPayload("word_text")
+            if word_start is None and word_end is None:
+                if saw_timed:
+                    raise InvalidPayload("word_span")
+                serialized_words.append({"start": None, "end": None, "text": word_text})
+                continue
+            if (not _finite(word_start) or not _finite(word_end) or float(word_start) < 0
+                    or float(word_end) < float(word_start)):
+                raise InvalidPayload("word_span")
+            if float(word_start) < previous_word_start or float(word_start) < float(start) or float(word_end) > float(end):
+                raise InvalidPayload("word_order")
+            previous_word_start = float(word_start)
+            saw_timed = True
+            serialized_words.append({"start": float(word_start), "end": float(word_end), "text": word_text})
+        if saw_timed:
+            if "".join(word["text"] for word in serialized_words) == text:
+                has_words = True
+            else:
+                serialized_words = []
+        lines.append({
+            "start": float(start),
+            "end": float(end),
+            "text": text,
+            "translation": translation,
+            "words": serialized_words,
+        })
+
+    duration = getattr(artifact, "duration_s", None)
+    if duration is None:
+        duration = _track_fields(track)[3]
+    elif not _finite(duration) or float(duration) <= 0:
+        raise InvalidPayload("duration")
+    elif duration is not None:
+        duration = float(duration)
+
+    return {
+        "schemaVersion": SCHEMA_VERSION,
+        "requestId": request_id,
+        "status": "ready",
+        "provider": provider,
+        "confidence": confidence,
+        "timing": "word" if has_words else "line",
+        "title": _bound_field(getattr(artifact, "title", "") or _track_fields(track)[0]),
+        "artist": _bound_field(getattr(artifact, "artist", "") or _track_fields(track)[1]),
+        "album": _bound_field(getattr(artifact, "album", "") or _track_fields(track)[2]),
+        "duration": duration,
+        "lines": lines,
+        "error": "",
+        "warnings": _sanitize_warnings(warnings),
+        "providerSongId": _provider_song_id(artifact),
+        "sourceKind": source_kind,
+        "cacheMode": cache_mode,
+        "searchTitle": _bound_field(_track_fields(track)[0]),
+        "searchArtist": _bound_field(_track_fields(track)[1]),
+        "searchAlbum": _bound_field(_track_fields(track)[2]),
+        "hasTranslation": _document_has_translation(lines),
+        "offsetMs": 0,
+        "offsetKey": None,
+        "providerAttempts": _sanitize_attempts(provider_attempts),
+        "savedAlias": _sanitize_alias(saved_alias),
+    }
+
+
+def _cache_artifact(hit: Any) -> Any | None:
+    if hit is None:
+        return None
+    return getattr(hit, "artifact", hit)
+
+
+def _cache_candidates(storage: Any, track: Any, parsers: dict[str, Any],
+                      *, include_automatic: bool = True) -> list[tuple[Any, str]]:
+    ordered: list[tuple[Any, str]] = []
+    try:
+        manual = _cache_artifact(storage.lookup_manual(track, parsers))
+    except Exception:
+        manual = None
+    if manual is not None:
+        ordered.append((manual, "manual"))
+    if include_automatic:
+        automatic: list[Any] = []
+        for provider in PROVIDER_ORDER:
+            parser = parsers.get(provider)
+            if parser is None:
+                continue
+            try:
+                artifact = _cache_artifact(storage.lookup(provider, track, parser))
+            except Exception:
+                continue
+            if artifact is not None:
+                automatic.append(artifact)
+        seen = [artifact for artifact, _mode in ordered]
+        for artifact in _ranked(automatic, track):
+            if all(artifact is not existing for existing in seen):
+                ordered.append((artifact, "auto"))
+                seen.append(artifact)
+    return ordered
+
+
+def _local_file_authority_ok(url: str) -> bool:
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except ValueError:
+        return False
+    return parts.scheme == "file" and parts.netloc in ("", "localhost")
+
+
+def _local_artifact(track: Any, url: Any) -> Any | None:
+    if not isinstance(url, str) or not url:
+        return None
+    if not LOCAL_AVAILABLE or not _local_file_authority_ok(url):
+        return None
+    try:
+        hint = _hint_from_player("", "", "", url)
+    except Exception:
+        return None
+    if hint is None or getattr(hint, "provider", "") != "local":
+        return None
+    local_path = getattr(hint, "local_path", None)
+    if local_path is None:
+        return None
+    try:
+        lines = _load_local_lyrics(Path(local_path))
+    except Exception:
+        return None
+    if not lines:
+        return None
+    title, artist, album, duration = _track_fields(track)
+    return _LyricsArtifact(
+        provider="local",
+        provider_song_id="",
+        title=title,
+        artist=artist,
+        album=album,
+        duration_s=duration,
+        payload={},
+        lines=tuple(lines),
+        confidence=MatchConfidence.HIGH,
+    )
+
+
+def _tighten_path(path: Any, mode: int) -> bool:
+    try:
+        st = os.stat(path)
+    except OSError:
+        return False
+    except AttributeError:
+        return False
+    try:
+        if st.st_uid != os.geteuid():
+            return False
+    except (OSError, AttributeError):
+        return False
+    try:
+        if stat.S_IMODE(st.st_mode) == mode:
+            return True
+        os.chmod(path, mode)
+    except OSError:
+        return False
+    return True
+
+
+def _storage_db_path(storage: Any) -> Path | None:
+    for attribute in ("_path", "path"):
+        candidate = getattr(storage, attribute, None)
+        if isinstance(candidate, Path):
+            return candidate
+        if isinstance(candidate, str) and candidate:
+            return Path(candidate)
+    return None
+
+
+def _cache_permission_warnings(storage: Any) -> list[str]:
+    db_path = _storage_db_path(storage)
+    if db_path is None:
+        return []
+    try:
+        if not db_path.parent.exists():
+            return []
+    except OSError:
+        return ["cache_permissions"]
+    if not _tighten_path(db_path.parent, 0o700):
+        return ["cache_permissions"]
+    try:
+        if not db_path.exists():
+            return []
+    except OSError:
+        return ["cache_permissions"]
+    if not _tighten_path(db_path, 0o600):
+        return ["cache_permissions"]
+    return []
+
+
+def _merge_warnings(first: list[str], second: list[str]) -> list[str]:
+    merged = list(first)
+    for item in second:
+        if item not in merged and len(merged) < MAX_WARNING_ITEMS:
+            merged.append(item)
+    return merged
+
+
+def _alias_db_path() -> Path:
+    base = os.environ.get("XDG_STATE_HOME") or os.path.join(os.path.expanduser("~"), ".local", "state")
+    return Path(base) / "n501.karaoke" / "search_aliases.sqlite3"
+
+def _alias_ensure_schema(connection: Any) -> bool:
+    # Persisted alias-store schema version: accept/init version 1, reject
+    # anything else without touching lyric payloads. Callers treat False as
+    # a bounded store failure so otherwise usable lyrics are preserved.
+    try:
+        row = connection.execute("PRAGMA user_version").fetchone()
+        version = int(row[0]) if row is not None else 0
+    except Exception:
+        return False
+    if version not in (0, ALIAS_SCHEMA_VERSION):
+        return False
+    try:
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS aliases ("
+            "track_title TEXT NOT NULL, track_artist TEXT NOT NULL, track_album TEXT NOT NULL, "
+            "query_title TEXT NOT NULL, query_artist TEXT NOT NULL, query_album TEXT NOT NULL, "
+            "provider TEXT NOT NULL, provider_song_id TEXT NOT NULL, "
+            "matched_title TEXT NOT NULL, matched_artist TEXT NOT NULL, matched_album TEXT NOT NULL, "
+            "updated_at REAL NOT NULL, "
+            "PRIMARY KEY (track_title, track_artist, track_album))"
+        )
+        if version == 0:
+            connection.execute(f"PRAGMA user_version = {ALIAS_SCHEMA_VERSION}")
+        connection.commit()
+    except Exception:
+        return False
+    return True
+
+
+def _alias_connect(db_path: Path) -> Any:
+    import sqlite3
+    try:
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
+    if not _tighten_path(db_path.parent, ALIAS_DIR_MODE):
+        return None
+    try:
+        connection = sqlite3.connect(str(db_path))
+    except OSError:
+        return None
+    if not _tighten_path(db_path, ALIAS_DB_MODE):
+        try:
+            connection.close()
+        except Exception:
+            pass
+        return None
+    if not _alias_ensure_schema(connection):
+        try:
+            connection.close()
+        except Exception:
+            pass
+        return None
+    return connection
+
+
+def _alias_track_key(track: Any) -> tuple[str, str, str]:
+    # Primary identity is the full normalized playback triple. Only saved
+    # query/display metadata is bounded at trust/output boundaries; truncating
+    # the key would collide distinct tracks sharing a 256-character prefix.
+    title, artist, album, _duration = _track_fields(track)
+    return (title, artist, album)
+
+
+def _alias_load(track: Any, db_path: Path | None = None) -> tuple[dict[str, Any] | None, list[str]]:
+    path = db_path if db_path is not None else _alias_db_path()
+    parent = path.parent
+    try:
+        if parent.exists() and not _tighten_path(parent, ALIAS_DIR_MODE):
+            return None, ["alias_store_permissions"]
+    except OSError:
+        return None, ["alias_store_failed"]
+    if not path.exists():
+        return None, []
+    try:
+        if not _tighten_path(path, ALIAS_DB_MODE):
+            return None, ["alias_store_permissions"]
+    except OSError:
+        return None, ["alias_store_failed"]
+    import sqlite3
+    try:
+        connection = sqlite3.connect(str(path))
+    except Exception:
+        return None, ["alias_store_failed"]
+    if not _alias_ensure_schema(connection):
+        try:
+            connection.close()
+        except Exception:
+            pass
+        return None, ["alias_store_failed"]
+    try:
+        key = _alias_track_key(track)
+        row = connection.execute(
+            "SELECT query_title, query_artist, query_album, provider, provider_song_id, "
+            "matched_title, matched_artist, matched_album FROM aliases "
+            "WHERE track_title = ? AND track_artist = ? AND track_album = ?",
+            key,
+        ).fetchone()
+    except Exception:
+        return None, ["alias_store_failed"]
+    finally:
+        try:
+            connection.close()
+        except Exception:
+            pass
+    if row is None:
+        return None, []
+    alias = {
+        "queryTitle": str(row[0] or "")[:MAX_FIELD_CHARS],
+        "queryArtist": str(row[1] or "")[:MAX_FIELD_CHARS],
+        "queryAlbum": str(row[2] or "")[:MAX_FIELD_CHARS],
+        "provider": str(row[3] or ""),
+        "songId": str(row[4] or ""),
+        "matchedTitle": str(row[5] or "")[:MAX_FIELD_CHARS],
+        "matchedArtist": str(row[6] or "")[:MAX_FIELD_CHARS],
+        "matchedAlbum": str(row[7] or "")[:MAX_FIELD_CHARS],
+    }
+    if alias["provider"] not in PROVIDER_ORDER or alias["songId"] == "":
+        return None, []
+    return alias, []
+
+
+def _alias_save(track: Any, query_track: Any, provider: str, song_id: str,
+                matched_title: str, matched_artist: str, matched_album: str,
+                db_path: Path | None = None) -> list[str]:
+    path = db_path if db_path is not None else _alias_db_path()
+    connection = _alias_connect(path)
+    if connection is None:
+        parent = path.parent
+        try:
+            if parent.exists():
+                import sqlite3
+                try:
+                    probe = sqlite3.connect(str(path))
+                    probe.close()
+                except Exception:
+                    return ["alias_store_failed"]
+                return ["alias_store_permissions"]
+        except OSError:
+            pass
+        return ["alias_store_failed"]
+    try:
+        key = _alias_track_key(track)
+        query_title, query_artist, query_album, _duration = _track_fields(query_track)
+        connection.execute(
+            "INSERT INTO aliases (track_title, track_artist, track_album, query_title, "
+            "query_artist, query_album, provider, provider_song_id, matched_title, "
+            "matched_artist, matched_album, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(track_title, track_artist, track_album) DO UPDATE SET "
+            "query_title = excluded.query_title, query_artist = excluded.query_artist, "
+            "query_album = excluded.query_album, provider = excluded.provider, "
+            "provider_song_id = excluded.provider_song_id, matched_title = excluded.matched_title, "
+            "matched_artist = excluded.matched_artist, matched_album = excluded.matched_album, "
+            "updated_at = excluded.updated_at",
+            (key[0], key[1], key[2], query_title[:MAX_FIELD_CHARS],
+             query_artist[:MAX_FIELD_CHARS], query_album[:MAX_FIELD_CHARS],
+             provider, song_id[:MAX_FIELD_CHARS],
+             str(matched_title or "")[:MAX_FIELD_CHARS],
+             str(matched_artist or "")[:MAX_FIELD_CHARS],
+             str(matched_album or "")[:MAX_FIELD_CHARS], time.time()),
+        )
+        connection.execute(
+            "DELETE FROM aliases WHERE rowid NOT IN ("
+            "SELECT rowid FROM aliases ORDER BY updated_at DESC, rowid DESC LIMIT ?)",
+            (ALIAS_MAX_ROWS,),
+        )
+        connection.commit()
+    except Exception:
+        return ["alias_store_failed"]
+    finally:
+        try:
+            connection.close()
+        except Exception:
+            pass
+    if not _tighten_path(path, ALIAS_DB_MODE):
+        return ["alias_store_permissions"]
+    return []
+
+
+def _alias_delete(track: Any, provider: str, song_id: str,
+                  db_path: Path | None = None) -> str:
+    path = db_path if db_path is not None else _alias_db_path()
+    try:
+        if not path.exists():
+            return "not-found"
+    except OSError:
+        return "alias_store_failed"
+    try:
+        parent = path.parent
+        if parent.exists() and not _tighten_path(parent, ALIAS_DIR_MODE):
+            return "alias_store_permissions"
+    except OSError:
+        return "alias_store_failed"
+    try:
+        if not _tighten_path(path, ALIAS_DB_MODE):
+            return "alias_store_permissions"
+    except OSError:
+        return "alias_store_failed"
+    import sqlite3
+    try:
+        connection = sqlite3.connect(str(path))
+    except Exception:
+        return "alias_store_failed"
+    if not _alias_ensure_schema(connection):
+        try:
+            connection.close()
+        except Exception:
+            pass
+        return "alias_store_failed"
+    try:
+        key = _alias_track_key(track)
+        cursor = connection.execute(
+            "DELETE FROM aliases WHERE track_title = ? AND track_artist = ? "
+            "AND track_album = ? AND provider = ? AND provider_song_id = ?",
+            (key[0], key[1], key[2], provider, song_id),
+        )
+        connection.commit()
+        return "deleted" if cursor.rowcount else "not-found"
+    except Exception:
+        try:
+            connection.rollback()
+        except Exception:
+            pass
+        return "alias_store_failed"
+    finally:
+        try:
+            connection.close()
+        except Exception:
+            pass
+def _normalize_query_override(raw_title: Any, raw_artist: Any, raw_album: Any) -> Any:
+    for raw in (raw_title, raw_artist, raw_album):
+        if raw is not None and not isinstance(raw, str):
+            raise ValueError("invalid_request")
+        if isinstance(raw, str) and len(raw) > MAX_FIELD_CHARS:
+            raise ValueError("invalid_request")
+    title = raw_title if isinstance(raw_title, str) else ""
+    artist = raw_artist if isinstance(raw_artist, str) else ""
+    album = raw_album if isinstance(raw_album, str) else ""
+    query_track = _track_for_lookup(title, artist, album, None)
+    query_title, _artist, _album, _duration = _track_fields(query_track)
+    if query_title == "":
+        raise ValueError("invalid_request")
+    return query_track
+
+
+async def _fetch_network(track: Any, providers: list[tuple[str, Any, Any]], session_factory: Any,
+                         deadline: float,
+                         consider: Any = None) -> tuple[list[tuple[Any, Any]], int, int, int, list[dict[str, Any]]]:
+
+    if not providers:
+        return [], 0, 0, 0, []
+    try:
+        session = session_factory()
+    except Exception:
+        return [], 0, 0, 0, []
+    completed = 0
+    clean = 0
+    usable = 0
+    attempts: list[dict[str, Any]] = []
+    winners: list[tuple[Any, Any]] = []
+    try:
+        deadline_at = time.monotonic() + max(deadline, 0.0)
+        for name, fetch, _parser in providers:
+            remaining = deadline_at - time.monotonic()
+            if remaining <= 0:
+                break
+            # Each provider is capped at min(remaining, 8s); skipped providers
+            # are absent from attempts. Only this coroutine is cancelled.
+            budget = min(remaining, PROVIDER_SUB_BUDGET_S)
+            try:
+                artifact = await asyncio.wait_for(fetch(session, track, fuzzy=True), timeout=budget)
+            except (asyncio.TimeoutError, TimeoutError):
+                attempts.append({"provider": name, "outcome": "timeout"})
+                continue
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                attempts.append({"provider": name, "outcome": "error"})
+                continue
+            completed += 1
+            if artifact is None:
+                clean += 1
+                attempts.append({"provider": name, "outcome": "not_found"})
+                continue
+            if _confidence_rank(getattr(artifact, "confidence", "none")) == 0:
+                clean += 1
+                attempts.append({"provider": name, "outcome": "not_found"})
+                continue
+            usable += 1
+            doc = None
+            try:
+                doc = consider(artifact) if consider is not None else artifact
+            except InvalidPayload:
+                attempts.append({"provider": name, "outcome": "rejected"})
+                continue
+            except Exception:
+                attempts.append({"provider": name, "outcome": "error"})
+                continue
+            if doc is None:
+                attempts.append({"provider": name, "outcome": "rejected"})
+                continue
+            attempts.append({"provider": name, "outcome": "candidate"})
+            winners.append((artifact, doc))
+            # Early stop only for provider-high, fully word-timed artifacts:
+            # every line must carry valid complete word timing. Mixed
+            # documents that serialize as timing "word" because one line has
+            # words must not starve later providers.
+            if (_confidence_value(getattr(artifact, "confidence", "")) == "high"
+                    and _artifact_is_fully_word_timed(artifact)):
+                break
+    finally:
+        try:
+            await session.close()
+        except Exception:
+            pass
+    return winners, completed, clean, usable, attempts
+
+
+def _rebuild_manual_artifact(chosen: Any, track: Any) -> Any:
+    title, artist, album, duration = _track_fields(track)
+    payload = getattr(chosen, "payload", None)
+    if not isinstance(payload, dict):
+        payload = {}
+    lines = getattr(chosen, "lines", None)
+    if not isinstance(lines, (list, tuple)):
+        raise InvalidPayload("lines")
+    try:
+        return type(chosen)(
+            provider=str(getattr(chosen, "provider", "") or ""),
+            provider_song_id=str(getattr(chosen, "provider_song_id", "") or ""),
+            title=title,
+            artist=artist,
+            album=album,
+            duration_s=duration,
+            payload=payload,
+            lines=lines,
+            confidence=getattr(chosen, "confidence"),
+        )
+    except InvalidPayload:
+        raise
+    except Exception as exc:
+        raise InvalidPayload("manual_rebuild") from exc
+
+
+async def fetch_lyrics(track: Any, request_id: int, *, storage: Any = None,
+                       provider_specs: list[tuple[str, Any, Any]] | None = None,
+                       session_factory: Any = None, deadline: float = 25.0,
+                       network: str = "auto", providers: list[str] | None = None,
+                       refresh: bool = False, url: Any = None, reported_title: Any = None,
+                       offset_store: Any = None,
+                       alias_db_path: Path | None = None) -> dict[str, Any]:
+    if IMPORT_ERROR is not None and provider_specs is None:
+        return _error_response(request_id, track, "dependency_error", "kotonoha_unavailable")
+    specs = provider_specs if provider_specs is not None else _providers()
+    # Cache parsers stay complete so provider toggles narrow only network
+    # requests and never break manual pins or cached hits.
+    parsers = {name: parser for name, _fetch, parser in specs}
+    if providers is not None:
+        wanted = set(providers)
+        specs = [spec for spec in specs if spec[0] in wanted]
+    if storage is None and IMPORT_ERROR is None:
+        storage = LyricsCacheStorage(cache_path(), max_entries=1000)
+    warnings = _cache_permission_warnings(storage) if storage is not None else []
+
+    try:
+        local = _local_artifact(track, url)
+    except Exception:
+        local = None
+    if local is not None:
+        try:
+            response = _serialize_artifact(local, request_id, track,
+                                           source_kind="local", cache_mode="none",
+                                           warnings=warnings)
+            _attach_offset(track, reported_title, url, local, response, offset_store)
+            return response
+        except InvalidPayload:
+            pass
+
+    # Saved corrections are authoritative after local lyrics. The alias key
+    # uses _track_for_lookup-normalized playback identity; fetch callers must
+    # pass an already-normalized track.
+    alias, alias_warnings = _alias_load(track, alias_db_path)
+    warnings = _merge_warnings(warnings, alias_warnings)
+    saved_alias = alias
+    if alias is not None:
+        alias_provider = alias["provider"]
+        alias_song = alias["songId"]
+        if storage is not None:
+            try:
+                manual_hit = _cache_artifact(storage.lookup_manual(track, parsers))
+            except Exception:
+                manual_hit = None
+            if (manual_hit is not None
+                    and str(getattr(manual_hit, "provider", "")) == alias_provider
+                    and str(getattr(manual_hit, "provider_song_id", "")) == alias_song):
+                try:
+                    response = _serialize_artifact(
+                        manual_hit, request_id, track,
+                        source_kind="cache", cache_mode="manual",
+                        warnings=warnings, saved_alias=saved_alias)
+                    _attach_offset(track, reported_title, url, manual_hit, response, offset_store)
+                    response["searchTitle"] = alias["queryTitle"]
+                    response["searchArtist"] = alias["queryArtist"]
+                    response["searchAlbum"] = alias["queryAlbum"]
+                    response["title"] = alias["matchedTitle"] or response["title"]
+                    response["artist"] = alias["matchedArtist"] or response["artist"]
+                    response["album"] = alias["matchedAlbum"] or response["album"]
+                    return response
+                except InvalidPayload:
+                    pass
+        network_off = network != "auto"
+        provider_enabled = providers is None or alias_provider in (providers or [])
+        provider_known = any(name == alias_provider for name, _f, _p in specs)
+        if not network_off and provider_enabled and provider_known:
+            query_track = _track_for_lookup(
+                alias["queryTitle"], alias["queryArtist"], alias["queryAlbum"], None)
+            alias_specs = [spec for spec in specs if spec[0] == alias_provider]
+
+            alias_exact = {"usable": False, "rejected": False}
+            def alias_consider(artifact: Any) -> dict[str, Any] | None:
+                if str(getattr(artifact, "provider_song_id", "")) != alias_song:
+                    return None
+                if _confidence_rank(getattr(artifact, "confidence", "none")) == 0:
+                    return None
+                alias_exact["usable"] = True
+                try:
+                    response = _serialize_artifact(artifact, request_id, track,
+                                                   source_kind="network", cache_mode="none",
+                                                   warnings=warnings)
+                except InvalidPayload:
+                    alias_exact["rejected"] = True
+                    raise
+                _attach_offset(track, reported_title, url, artifact, response, offset_store)
+                return response
+
+            winners, _completed, _clean, _usable, alias_attempts = await _fetch_network(
+                query_track, alias_specs, session_factory or new_lyrics_session,
+                deadline, alias_consider)
+            if winners:
+                artifact = winners[0][0]
+                try:
+                    rebuilt = _rebuild_manual_artifact(artifact, track)
+                    if storage is not None:
+                        try:
+                            storage.upsert(rebuilt, LyricsCacheMode.MANUAL)
+                        except Exception:
+                            # The rebuilt correction cannot be persisted, so it
+                            # must not be reported as a durable cache/manual
+                            # hit: the next offline process would answer
+                            # alias_unavailable for the same alias.
+                            return _error_response(
+                                request_id, track, "provider_error", "cache_store_failed",
+                                warnings=warnings, provider_attempts=alias_attempts,
+                                saved_alias=saved_alias)
+                    response = _serialize_artifact(
+                        rebuilt, request_id, track,
+                        source_kind="cache", cache_mode="manual",
+                        warnings=warnings, provider_attempts=alias_attempts,
+                        saved_alias=saved_alias)
+                    _attach_offset(track, reported_title, url, rebuilt, response, offset_store)
+                    response["searchTitle"] = alias["queryTitle"]
+                    response["searchArtist"] = alias["queryArtist"]
+                    response["searchAlbum"] = alias["queryAlbum"]
+                    response["title"] = alias["matchedTitle"] or response["title"]
+                    response["artist"] = alias["matchedArtist"] or response["artist"]
+                    response["album"] = alias["matchedAlbum"] or response["album"]
+                    return response
+                except InvalidPayload:
+                    # The saved provider returned the exact song, but its
+                    # payload cannot be serialized: report malformed data
+                    # rather than an unavailable alias, and never claim a
+                    # cache/manual hit.
+                    return _error_response(request_id, track, "provider_error", "invalid_payload",
+                                           warnings=warnings, provider_attempts=alias_attempts,
+                                           saved_alias=saved_alias)
+            if alias_exact["rejected"] or alias_exact["usable"]:
+                # An exact saved candidate completed but was rejected as
+                # malformed: preserve the saved alias and the rejected
+                # attempt instead of inviting deletion of a live correction.
+                return _error_response(request_id, track, "provider_error", "invalid_payload",
+                                       warnings=warnings, provider_attempts=alias_attempts,
+                                       saved_alias=saved_alias)
+            return _error_response(request_id, track, "not_found", "alias_unavailable",
+                                   warnings=warnings, provider_attempts=alias_attempts,
+                                   saved_alias=saved_alias)
+        else:
+            return _error_response(request_id, track, "not_found", "alias_unavailable",
+                                   warnings=warnings, saved_alias=saved_alias)
+
+    candidates: list[tuple[Any, str]] = []
+    if storage is not None:
+        candidates = _cache_candidates(storage, track, parsers, include_automatic=not refresh)
+        # Cache lookups open (and may create) the database file, so tighten
+        # again now that it is guaranteed to exist when storage is real.
+        warnings = _merge_warnings(warnings, _cache_permission_warnings(storage))
+        for cached, cache_mode in candidates:
+            try:
+                response = _serialize_artifact(cached, request_id, track,
+                                               source_kind="cache", cache_mode=cache_mode,
+                                               warnings=warnings, saved_alias=saved_alias)
+                _attach_offset(track, reported_title, url, cached, response, offset_store)
+                return response
+            except InvalidPayload:
+                continue
+
+    network_off = network != "auto"
+    if network_off or not specs:
+        return _error_response(request_id, track, "not_found", "network_disabled",
+                               warnings=warnings, saved_alias=saved_alias)
+
+    def consider(artifact: Any) -> dict[str, Any]:
+        response = _serialize_artifact(artifact, request_id, track,
+                                       source_kind="network", cache_mode="none",
+                                       warnings=warnings)
+        _attach_offset(track, reported_title, url, artifact, response, offset_store)
+        return response
+
+    winners, completed, clean, usable, attempts = await _fetch_network(
+        track, specs, session_factory or new_lyrics_session, deadline, consider)
+    if winners:
+        docs_by_artifact = {id(artifact): doc for artifact, doc in winners}
+        for candidate in _ranked([artifact for artifact, _doc in winners], track):
+            response = docs_by_artifact[id(candidate)]
+            response["providerAttempts"] = _sanitize_attempts(attempts)
+            response["savedAlias"] = _sanitize_alias(saved_alias)
+            if storage is not None and _confidence_value(getattr(candidate, "confidence", "")) == "high":
+                try:
+                    storage.upsert(candidate, LyricsCacheMode.AUTO)
+                except Exception:
+                    pass
+            return response
+    if usable:
+        # At least one provider completed without timed lines: not-found wins;
+        # provider_error only when every provider failed.
+        if clean:
+            return _error_response(request_id, track, "not_found", "", warnings=warnings,
+                                   provider_attempts=attempts, saved_alias=saved_alias)
+        return _error_response(request_id, track, "provider_error", "invalid_payload",
+                               warnings=warnings, provider_attempts=attempts,
+                               saved_alias=saved_alias)
+    return _error_response(
+        request_id,
+        track,
+        "not_found" if completed else "provider_error",
+        "" if completed else "providers_failed",
+        warnings=warnings,
+        provider_attempts=attempts,
+        saved_alias=saved_alias,
+    )
+
+
+SEARCH_TIMEOUT_S = 20.0
+MAX_SEARCH_LIMIT = 10
+
+
+class _SearchUnavailable(Exception):
+    pass
+
+
+def _search_functions() -> dict[str, Any]:
+    return {name: fn for name, fn in (
+        ("netease", _search_netease),
+        ("lrclib", _search_lrclib),
+        ("kugou", _search_kugou),
+    ) if fn is not None}
+
+
+async def _search_artifacts_for(track: Any, provider: str, *, search_fns: Any = None,
+                                session_factory: Any = None,
+                                timeout: float = SEARCH_TIMEOUT_S) -> Any:
+    fns = search_fns if search_fns is not None else _search_functions()
+    fn = fns.get(provider)
+    if fn is None:
+        raise _SearchUnavailable(provider)
+    factory = session_factory or (None if IMPORT_ERROR is not None else new_lyrics_session)
+    if factory is None:
+        raise _SearchUnavailable(provider)
+    session = factory()
+    try:
+        return await asyncio.wait_for(fn(session, track), timeout=timeout)
+    finally:
+        try:
+            await session.close()
+        except Exception:
+            pass
+
+
+def _search_query(track: Any) -> dict[str, Any]:
+    title, artist, album, duration = _track_fields(track)
+    return {"title": _bound_field(title), "artist": _bound_field(artist),
+            "album": _bound_field(album), "duration": duration}
+
+
+def _search_error(request_id: int, track: Any, status: str, error: str) -> dict[str, Any]:
+    return {
+        "schemaVersion": SCHEMA_VERSION,
+        "requestId": request_id,
+        "status": status,
+        "query": _search_query(track),
+        "results": [],
+        "error": error,
+    }
+
+
+def _search_row(provider: str, artifact: Any) -> dict[str, Any] | None:
+    song_id = getattr(artifact, "provider_song_id", None)
+    if not isinstance(song_id, str) or song_id == "":
+        return None
+    if _confidence_rank(getattr(artifact, "confidence", "none")) == 0:
+        return None
+    try:
+        lines = getattr(artifact, "lines", None) or ()
+        timed = _artifact_has_words(artifact) if len(lines) > 0 else False
+    except TypeError:
+        return None
+    if not timed and not lines:
+        return None
+    timing = "word" if timed else "line"
+    duration = getattr(artifact, "duration_s", None)
+    if not _finite(duration) or float(duration) <= 0:
+        duration = None
+    else:
+        duration = float(duration)
+    try:
+        has_translation = any(isinstance(getattr(line, "translation", ""), str)
+                              and getattr(line, "translation", "") != "" for line in lines)
+    except TypeError:
+        return None
+    return {
+        "provider": provider,
+        "songId": _bound_field(song_id),
+        "title": _bound_field(getattr(artifact, "title", "") or ""),
+        "artist": _bound_field(getattr(artifact, "artist", "") or ""),
+        "album": _bound_field(getattr(artifact, "album", "") or ""),
+        "duration": duration,
+        "confidence": _confidence_value(getattr(artifact, "confidence", "")),
+        "timing": timing,
+        "hasTranslation": bool(has_translation),
+    }
+
+
+async def search_provider(track: Any, request_id: int, provider: str, *,
+                          search_fns: Any = None, session_factory: Any = None,
+                          limit: int = MAX_SEARCH_LIMIT,
+                          timeout: float = SEARCH_TIMEOUT_S,
+                          query_track: Any = None) -> dict[str, Any]:
+    lookup = query_track if query_track is not None else track
+    if IMPORT_ERROR is not None and search_fns is None:
+        return _search_error(request_id, lookup, "dependency_error", "kotonoha_unavailable")
+    try:
+        found = await _search_artifacts_for(lookup, provider, search_fns=search_fns,
+                                            session_factory=session_factory, timeout=timeout)
+    except _SearchUnavailable:
+        return _search_error(request_id, lookup, "provider_error", "search_unavailable")
+    except Exception:
+        return _search_error(request_id, lookup, "provider_error", "search_failed")
+    try:
+        wanted = max(1, min(int(limit), MAX_SEARCH_LIMIT))
+    except (TypeError, ValueError):
+        wanted = MAX_SEARCH_LIMIT
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for artifact in found or ():
+        try:
+            row = _search_row(provider, artifact)
+        except Exception:
+            continue
+        if row is None:
+            continue
+        key = provider + ":" + row["songId"]
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append(row)
+        if len(rows) >= wanted:
+            break
+    if not rows:
+        return _search_error(request_id, lookup, "not_found", "")
+    return {
+        "schemaVersion": SCHEMA_VERSION,
+        "requestId": request_id,
+        "status": "ready",
+        "query": _search_query(lookup),
+        "results": rows,
+        "error": "",
+    }
+
+
+async def select_entry(track: Any, request_id: int, provider: str, song_id: str, *,
+                       storage: Any = None, search_fns: Any = None,
+                       session_factory: Any = None, timeout: float = SEARCH_TIMEOUT_S,
+                       warnings: list[str] | None = None, reported_title: Any = None,
+                       url: Any = None, offset_store: Any = None,
+                       query_track: Any = None,
+                       alias_db_path: Path | None = None) -> dict[str, Any]:
+    lookup = query_track if query_track is not None else track
+    if IMPORT_ERROR is not None and search_fns is None:
+        return _error_response(request_id, track, "dependency_error", "kotonoha_unavailable")
+    if storage is None and IMPORT_ERROR is None:
+        storage = LyricsCacheStorage(cache_path(), max_entries=1000)
+    try:
+        found = await _search_artifacts_for(lookup, provider, search_fns=search_fns,
+                                            session_factory=session_factory, timeout=timeout)
+    except _SearchUnavailable:
+        return _error_response(request_id, track, "provider_error", "search_unavailable")
+    except Exception:
+        return _error_response(request_id, track, "provider_error", "search_failed")
+    chosen = None
+    for artifact in found or ():
+        if str(getattr(artifact, "provider", "")) != provider:
+            continue
+        if getattr(artifact, "provider_song_id", None) != song_id:
+            continue
+        if _confidence_rank(getattr(artifact, "confidence", "none")) == 0:
+            continue
+        chosen = artifact
+        break
+    if chosen is None:
+        return _error_response(request_id, track, "not_found", "selection_not_found")
+    query_title, query_artist, query_album, _duration = _track_fields(lookup)
+    matched_title = str(getattr(chosen, "title", "") or "")
+    matched_artist = str(getattr(chosen, "artist", "") or "")
+    matched_album = str(getattr(chosen, "album", "") or "")
+    saved_alias: dict[str, Any] | None = {
+        "queryTitle": query_title[:MAX_FIELD_CHARS],
+        "queryArtist": query_artist[:MAX_FIELD_CHARS],
+        "queryAlbum": query_album[:MAX_FIELD_CHARS],
+        "provider": provider,
+        "songId": str(song_id)[:MAX_FIELD_CHARS],
+        "matchedTitle": matched_title[:MAX_FIELD_CHARS],
+        "matchedArtist": matched_artist[:MAX_FIELD_CHARS],
+        "matchedAlbum": matched_album[:MAX_FIELD_CHARS],
+    }
+    try:
+        response = _serialize_artifact(chosen, request_id, lookup,
+                                       source_kind="cache", cache_mode="manual",
+                                       warnings=warnings, saved_alias=saved_alias)
+        _attach_offset(track, reported_title, url, chosen, response, offset_store)
+    except InvalidPayload:
+        return _error_response(request_id, track, "provider_error", "invalid_payload")
+    if not isinstance(response.get("providerSongId"), str) or not response["providerSongId"]:
+        return _error_response(request_id, track, "provider_error", "invalid_payload")
+    if storage is not None:
+        try:
+            manual_artifact = _rebuild_manual_artifact(chosen, track)
+        except InvalidPayload:
+            return _error_response(request_id, track, "provider_error", "invalid_payload")
+        try:
+            storage.upsert(manual_artifact, LyricsCacheMode.MANUAL)
+        except Exception:
+            return _error_response(request_id, track, "provider_error", "cache_store_failed")
+        # The upsert guarantees the cache file exists when storage is real;
+        # tighten permissions without ever losing the selected document.
+        try:
+            permission_warnings = _cache_permission_warnings(storage)
+        except Exception:
+            permission_warnings = []
+        merged = _merge_warnings(
+            _sanitize_warnings(response.get("warnings")), permission_warnings)
+        # The alias row is metadata-only; its failure never discards lyrics.
+        try:
+            alias_warnings = _alias_save(track, lookup, provider, str(song_id),
+                                         matched_title, matched_artist, matched_album,
+                                         alias_db_path)
+        except Exception:
+            alias_warnings = ["alias_store_failed"]
+        merged = _merge_warnings(merged, alias_warnings)
+        if merged:
+            response["warnings"] = merged
+    return response
+
+
+def _forget_response(request_id: int, status: str, delete_status: str, error: str,
+                     alias_delete_status: str = "not-found") -> dict[str, Any]:
+    return {
+        "schemaVersion": SCHEMA_VERSION,
+        "requestId": request_id,
+        "status": status,
+        "deleteStatus": delete_status,
+        "aliasDeleteStatus": alias_delete_status,
+        "error": error,
+    }
+
+
+def forget_entry(request_id: int, provider: str, song_id: str, *,
+                 storage: Any = None, track: Any = None,
+                 alias_db_path: Path | None = None) -> dict[str, Any]:
+    if IMPORT_ERROR is not None and storage is None:
+        return _forget_response(request_id, "dependency_error", "", "kotonoha_unavailable")
+    if storage is None:
+        storage = LyricsCacheStorage(cache_path(), max_entries=1000)
+    try:
+        result = storage.delete(LyricsCacheKey(provider, song_id))
+    except Exception:
+        return _forget_response(request_id, "provider_error", "", "cache_delete_failed")
+    raw = getattr(getattr(result, "status", None), "value", getattr(result, "status", ""))
+    delete_status = "deleted" if raw == "deleted" else "not-found"
+    alias_status = "not-found"
+    if track is not None:
+        try:
+            alias_status = _alias_delete(track, provider, song_id, alias_db_path)
+        except Exception:
+            alias_status = "alias_store_failed"
+        if alias_status in ("alias_store_failed", "alias_store_permissions"):
+            # Honest alias-store failure: the shared-cache deletion already
+            # ran, but the correction cannot be confirmed removed. Surface a
+            # bounded store error instead of claiming ready/not-found so the
+            # panel preserves the saved selection.
+            return _forget_response(request_id, "provider_error", delete_status,
+                                    alias_status, alias_status)
+    return _forget_response(request_id, "ready", delete_status, "", alias_status)
+
+
+_OFFSET_MISSING = object()
+
+
+def _offset_key_to_json(key: Any) -> dict[str, Any]:
+    return {
+        "trackTitle": key.track_title,
+        "trackArtist": key.track_artist,
+        "trackAlbum": key.track_album,
+        "trackDurationS": key.track_duration_s,
+        "lyricsSourceId": key.lyrics_source_id,
+        "lyricsSongId": key.lyrics_song_id,
+        "lyricsDigest": key.lyrics_digest,
+    }
+
+
+def _offset_key_from_json(data: Any) -> Any:
+    if not isinstance(data, dict):
+        raise ValueError("offset_key")
+    try:
+        title = data["trackTitle"]
+        artist = data["trackArtist"]
+        album = data["trackAlbum"]
+        duration = data["trackDurationS"]
+        source_id = data["lyricsSourceId"]
+        song_id = data["lyricsSongId"]
+        digest = data["lyricsDigest"]
+    except KeyError as exc:
+        raise ValueError("offset_key") from exc
+    for field in (title, artist, album, source_id, digest):
+        if not isinstance(field, str):
+            raise ValueError("offset_key")
+    if duration is not None and (isinstance(duration, bool) or not isinstance(duration, int)):
+        raise ValueError("offset_key")
+    if song_id is not None and not isinstance(song_id, str):
+        raise ValueError("offset_key")
+    return _TrackOffsetKey(track_title=title, track_artist=artist, track_album=album,
+                           track_duration_s=duration, lyrics_source_id=source_id,
+                           lyrics_song_id=song_id, lyrics_digest=digest)
+
+
+def _offset_identity_key(track: Any, reported_title: Any, url: Any, artifact: Any) -> Any | None:
+    if not OFFSET_AVAILABLE:
+        return None
+    title, artist, album, duration = _track_fields(track)
+    raw_title = str(reported_title) if isinstance(reported_title, str) else title
+    local_url = url if isinstance(url, str) and url else None
+    provider = str(getattr(artifact, "provider", "") or "")
+    song_id = getattr(artifact, "provider_song_id", None)
+    song_id = song_id if isinstance(song_id, str) and song_id else None
+    lines = getattr(artifact, "lines", None) or ()
+    try:
+        identity = _TrackIdentity(
+            adapter_id="omarchy", player_id="active",
+            title=title, raw_title=raw_title, artist=artist, album=album,
+            url=local_url, duration_s=duration,
+        )
+        document = _LyricsDocumentAdapter().adapt(
+            tuple(lines), source_id=provider or "unknown", song_id=song_id,
+            title=title or None, artist=artist or None, album=album or None,
+            duration_s=duration,
+        )
+        return _track_offset_key(identity, document)
+    except Exception:
+        return None
+
+
+def _offset_store_for(offset_store: Any) -> Any | None:
+    if offset_store is not None:
+        return offset_store
+    if not OFFSET_AVAILABLE:
+        return None
+    try:
+        return _TrackOffsetStore()
+    except Exception:
+        return None
+
+
+def _offset_db_path(store: Any) -> Path | None:
+    candidate = getattr(store, "_path", None)
+    if isinstance(candidate, Path):
+        return candidate
+    if isinstance(candidate, str) and candidate:
+        return Path(candidate)
+    try:
+        from kotonoha.state.track_offset_store import track_offset_path as _default_offset_path
+        return _default_offset_path()
+    except Exception:
+        return None
+
+
+def _offset_permission_warnings(store: Any) -> list[str]:
+    db_path = _offset_db_path(store)
+    if db_path is None:
+        return []
+    try:
+        if not db_path.exists():
+            return []
+    except OSError:
+        return []
+    if _tighten_path(db_path.parent, 0o700) and _tighten_path(db_path, 0o600):
+        return []
+    return ["offset_store_permissions"]
+
+
+def _attach_offset(track: Any, reported_title: Any, url: Any,
+                   artifact: Any, response: dict[str, Any], offset_store: Any) -> None:
+    if offset_store is None:
+        response["offsetKey"] = None
+        response["offsetMs"] = 0
+        return
+    try:
+        key = _offset_identity_key(track, reported_title, url, artifact)
+    except Exception:
+        key = None
+    if key is None:
+        response["offsetKey"] = None
+        response["offsetMs"] = 0
+        return
+    try:
+        store = _offset_store_for(offset_store)
+        if store is None:
+            raise ValueError("offset_store")
+        offset_ms = store.load().offset_for(key)
+        try:
+            permission_warnings = _offset_permission_warnings(store)
+        except Exception:
+            permission_warnings = []
+        if permission_warnings:
+            response["warnings"] = _merge_warnings(
+                _sanitize_warnings(response.get("warnings")), permission_warnings)
+    except Exception:
+        response["offsetKey"] = None
+        response["offsetMs"] = 0
+        return
+    response["offsetKey"] = _offset_key_to_json(key)
+    response["offsetMs"] = offset_ms if isinstance(offset_ms, int) else 0
+
+
+def _offset_response(request_id: int, status: str, offset_ms: Any,
+                     offset_key: Any, error: str,
+                     warnings: list[str] | None = None) -> dict[str, Any]:
+    return {
+        "schemaVersion": SCHEMA_VERSION,
+        "requestId": request_id,
+        "status": status,
+        "offsetMs": offset_ms,
+        "offsetKey": offset_key,
+        "error": error,
+        "warnings": _sanitize_warnings(warnings),
+    }
+
+
+def offset_write(request_id: int, key_json: Any, *, delta_ms: Any = _OFFSET_MISSING,
+                 set_ms: Any = _OFFSET_MISSING, store: Any = None) -> dict[str, Any]:
+    if (delta_ms is _OFFSET_MISSING) == (set_ms is _OFFSET_MISSING):
+        raise ValueError("offset_amount")
+    for value in (delta_ms, set_ms):
+        if value is _OFFSET_MISSING:
+            continue
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError("offset_amount")
+    try:
+        data = json.loads(key_json) if isinstance(key_json, str) else key_json
+        key = _offset_key_from_json(data)
+    except (ValueError, TypeError):
+        raise ValueError("offset_key")
+    storage = _offset_store_for(store)
+    if storage is None:
+        return _offset_response(request_id, "provider_error", 0, None, "offset_unavailable")
+    try:
+        current = storage.load().offset_for(key)
+    except Exception:
+        return _offset_response(request_id, "provider_error", 0, _offset_key_to_json(key),
+                                "offset_store_failed")
+    if not isinstance(current, int):
+        current = 0
+    target = current + delta_ms if delta_ms is not _OFFSET_MISSING else set_ms
+    try:
+        offset_ms = _clamp_track_offset(target)
+        storage.upsert(_TrackOffsetEntry(key, offset_ms))
+    except Exception:
+        return _offset_response(request_id, "provider_error", 0, _offset_key_to_json(key),
+                                "offset_store_failed")
+    try:
+        permission_warnings = _offset_permission_warnings(storage)
+    except Exception:
+        permission_warnings = []
+    return _offset_response(request_id, "ready", offset_ms, _offset_key_to_json(key), "",
+                            warnings=permission_warnings)
+
+
+def _safe_output_text(value: Any) -> str:
+    return str(value or "")[:1024]
+
+
+def _bounded_json(response: dict[str, Any]) -> str:
+    raw = json.dumps(response, ensure_ascii=False, separators=(",", ":"))
+    if len(raw.encode("utf-8")) <= MAX_OUTPUT_BYTES:
+        return raw
+    duration = response.get("duration")
+    safe_duration = float(duration) if _finite(duration) and float(duration) > 0 else None
+    fallback = {
+        "schemaVersion": SCHEMA_VERSION,
+        "requestId": int(response.get("requestId", 0)),
+        "status": "provider_error",
+        "provider": "",
+        "confidence": "none",
+        "timing": "none",
+        "title": _safe_output_text(response.get("title")),
+        "artist": _safe_output_text(response.get("artist")),
+        "album": _safe_output_text(response.get("album")),
+        "duration": safe_duration,
+        "lines": [],
+        "error": "payload_too_large",
+        "warnings": [],
+        "providerAttempts": [],
+        "savedAlias": None,
+    }
+    return json.dumps(fallback, ensure_ascii=False, separators=(",", ":"))
+
+
+def _bounded_search_json(response: dict[str, Any]) -> str:
+    raw = json.dumps(response, ensure_ascii=False, separators=(",", ":"))
+    if len(raw.encode("utf-8")) <= MAX_OUTPUT_BYTES:
+        return raw
+    query = response.get("query") if isinstance(response.get("query"), dict) else {}
+    fallback = {
+        "schemaVersion": SCHEMA_VERSION,
+        "requestId": int(response.get("requestId", 0)),
+        "status": "provider_error",
+        "query": {
+            "title": _safe_output_text(query.get("title")),
+            "artist": _safe_output_text(query.get("artist")),
+            "album": _safe_output_text(query.get("album")),
+            "duration": None,
+        },
+        "results": [],
+        "error": "payload_too_large",
+    }
+    return json.dumps(fallback, ensure_ascii=False, separators=(",", ":"))
+
+
+def _bounded_forget_json(response: dict[str, Any]) -> str:
+    raw = json.dumps(response, ensure_ascii=False, separators=(",", ":"))
+    if len(raw.encode("utf-8")) <= MAX_OUTPUT_BYTES:
+        return raw
+    return json.dumps({
+        "schemaVersion": SCHEMA_VERSION,
+        "requestId": int(response.get("requestId", 0)),
+        "status": "provider_error",
+        "deleteStatus": "",
+        "aliasDeleteStatus": "not-found",
+        "error": "payload_too_large",
+    }, ensure_ascii=False, separators=(",", ":"))
+
+
+def _bounded_offset_json(response: dict[str, Any]) -> str:
+    raw = json.dumps(response, ensure_ascii=False, separators=(",", ":"))
+    if len(raw.encode("utf-8")) <= MAX_OUTPUT_BYTES:
+        return raw
+    return json.dumps({
+        "schemaVersion": SCHEMA_VERSION,
+        "requestId": int(response.get("requestId", 0)),
+        "status": "provider_error",
+        "offsetMs": 0,
+        "offsetKey": None,
+        "error": "payload_too_large",
+        "warnings": [],
+    }, ensure_ascii=False, separators=(",", ":"))
+
+
+def _bounded_capabilities_json(response: dict[str, Any]) -> str:
+    raw = json.dumps(response, ensure_ascii=False, separators=(",", ":"))
+    if len(raw.encode("utf-8")) <= MAX_OUTPUT_BYTES:
+        return raw
+    return json.dumps({
+        "schemaVersion": SCHEMA_VERSION,
+        "requestId": int(response.get("requestId", 0)),
+        "status": "provider_error",
+        "kotonohaVersion": "",
+        "capabilities": {"local": False, "offset": False, "search": [],
+                         "matchEvidence": False},
+        "error": "payload_too_large",
+    }, ensure_ascii=False, separators=(",", ":"))
+
+
+def _normalize_providers(raw: str | None) -> list[str]:
+    if raw is None:
+        return list(PROVIDER_ORDER)
+    ids = [part.strip() for part in str(raw).split(",")]
+    ids = [part for part in ids if part != ""]
+    unknown = [part for part in ids if part not in PROVIDER_ORDER]
+    if unknown:
+        raise ValueError("invalid_request")
+    return [name for name in PROVIDER_ORDER if name in set(ids)]
+
+
+def _kotonoha_version() -> str:
+    version = ""
+    try:
+        import importlib.metadata as metadata
+        version = str(metadata.version("kotonoha") or "")
+    except Exception:
+        version = ""
+    if not version:
+        try:
+            import kotonoha
+            version = str(getattr(kotonoha, "__version__", "") or "")
+        except Exception:
+            version = ""
+    return version[:MAX_VERSION_CHARS]
+
+def _capabilities_payload() -> dict[str, Any]:
+    return {
+        "local": bool(LOCAL_AVAILABLE),
+        "offset": bool(OFFSET_AVAILABLE),
+        "search": [name for name in PROVIDER_ORDER if _SEARCH_AVAILABLE.get(name, False)],
+        "matchEvidence": bool(MATCH_EVIDENCE_AVAILABLE),
+    }
+
+
+def capabilities_response(request_id: int) -> dict[str, Any]:
+    return {
+        "schemaVersion": SCHEMA_VERSION,
+        "requestId": request_id,
+        "status": "ready",
+        "kotonohaVersion": _kotonoha_version(),
+        "capabilities": _capabilities_payload(),
+        "error": "",
+    }
+
+
+def _parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(prog="karaoke-lyrics")
+    subparsers = parser.add_subparsers(dest="action", required=True)
+    fetch = subparsers.add_parser("fetch")
+    fetch.add_argument("--request-id", type=int, required=True)
+    fetch.add_argument("--title", required=True)
+    fetch.add_argument("--artist", required=True)
+    fetch.add_argument("--album", default="")
+    fetch.add_argument("--duration", type=float)
+    fetch.add_argument("--url", default=None)
+    fetch.add_argument("--network", default="auto")
+    fetch.add_argument("--providers", default=None)
+    fetch.add_argument("--refresh", action="store_true")
+    capabilities = subparsers.add_parser("capabilities")
+    capabilities.add_argument("--request-id", type=int, required=True)
+    search = subparsers.add_parser("search")
+    search.add_argument("--request-id", type=int, required=True)
+    search.add_argument("--title", required=True)
+    search.add_argument("--artist", required=True)
+    search.add_argument("--album", default="")
+    search.add_argument("--duration", type=float)
+    search.add_argument("--provider", required=True)
+    search.add_argument("--limit", type=int, default=10)
+    search.add_argument("--query-title", default=None)
+    search.add_argument("--query-artist", default=None)
+    search.add_argument("--query-album", default=None)
+    select = subparsers.add_parser("select")
+    select.add_argument("--request-id", type=int, required=True)
+    select.add_argument("--title", required=True)
+    select.add_argument("--artist", required=True)
+    select.add_argument("--album", default="")
+    select.add_argument("--duration", type=float)
+    select.add_argument("--provider", required=True)
+    select.add_argument("--song-id", required=True)
+    select.add_argument("--query-title", default=None)
+    select.add_argument("--query-artist", default=None)
+    select.add_argument("--query-album", default=None)
+    forget = subparsers.add_parser("forget")
+    forget.add_argument("--request-id", type=int, required=True)
+    forget.add_argument("--provider", required=True)
+    forget.add_argument("--song-id", required=True)
+    forget.add_argument("--title", required=True)
+    forget.add_argument("--artist", required=True)
+    forget.add_argument("--album", default="")
+    forget.add_argument("--duration", type=float)
+    offset = subparsers.add_parser("offset")
+    offset.add_argument("--request-id", type=int, required=True)
+    offset.add_argument("--key-json", required=True)
+    amount = offset.add_mutually_exclusive_group(required=True)
+    amount.add_argument("--delta-ms", type=int)
+    amount.add_argument("--set-ms", type=int)
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    raw_argv = argv if argv is not None else sys.argv[1:]
+    request_id = 0
+    for index, value in enumerate(raw_argv):
+        if value == "--request-id" and index + 1 < len(raw_argv):
+            try:
+                request_id = int(raw_argv[index + 1])
+            except ValueError:
+                pass
+            break
+    empty_track = type("Track", (), {"title": "", "artist": "", "album": "", "duration_s": None})()
+    try:
+        args = _parse_args(raw_argv)
+    except SystemExit as exc:
+        if exc.code is None or exc.code == 0:
+            raise
+        print(_bounded_json(_error_response(request_id, empty_track, "provider_error", "invalid_request")))
+        return 2
+    if args.action == "capabilities":
+        try:
+            if args.request_id < 0:
+                raise ValueError("invalid_request")
+            request_id = args.request_id
+        except (ValueError, TypeError, argparse.ArgumentError):
+            print(_bounded_json(_error_response(request_id, empty_track, "provider_error", "invalid_request")))
+            return 0
+        # The probe reports optional-feature support even when core imports
+        # failed; only an invalid request is an error.
+        print(_bounded_capabilities_json(capabilities_response(request_id)))
+        return 0
+    if args.action == "search":
+        try:
+            if args.request_id < 0:
+                raise ValueError("invalid_request")
+            request_id = args.request_id
+            if args.duration is not None and (not _finite(args.duration) or args.duration <= 0):
+                raise ValueError("invalid_request")
+            if args.provider not in PROVIDER_ORDER:
+                raise ValueError("invalid_request")
+            limit = int(args.limit)
+            if limit < 1 or limit > MAX_SEARCH_LIMIT:
+                raise ValueError("invalid_request")
+        except (ValueError, TypeError, argparse.ArgumentError):
+            print(_bounded_search_json(_search_error(
+                request_id, empty_track, "provider_error", "invalid_request")))
+            return 0
+        if IMPORT_ERROR is not None:
+            print(_bounded_search_json(_search_error(
+                request_id, empty_track, "dependency_error", "kotonoha_unavailable")))
+            return 0
+        try:
+            if (args.query_title is not None or args.query_artist is not None
+                    or args.query_album is not None):
+                query_track = _normalize_query_override(
+                    args.query_title, args.query_artist, args.query_album)
+            else:
+                query_track = _track_for_lookup(args.title, args.artist, args.album, args.duration)
+            track = _track_for_lookup(args.title, args.artist, args.album, args.duration)
+            response = asyncio.run(search_provider(
+                track, request_id, args.provider, limit=limit, query_track=query_track))
+        except ValueError:
+            response = _search_error(request_id, empty_track, "provider_error", "invalid_request")
+        except Exception:
+            response = _search_error(request_id, empty_track, "dependency_error", "kotonoha_unavailable")
+        print(_bounded_search_json(response))
+        return 0
+    if args.action == "select":
+        try:
+            if args.request_id < 0:
+                raise ValueError("invalid_request")
+            request_id = args.request_id
+            if args.duration is not None and (not _finite(args.duration) or args.duration <= 0):
+                raise ValueError("invalid_request")
+            if args.provider not in PROVIDER_ORDER:
+                raise ValueError("invalid_request")
+            if not isinstance(args.song_id, str) or args.song_id == "":
+                raise ValueError("invalid_request")
+        except (ValueError, TypeError, argparse.ArgumentError):
+            print(_bounded_json(_error_response(request_id, empty_track, "provider_error", "invalid_request")))
+            return 0
+        if IMPORT_ERROR is not None:
+            print(_bounded_json(_error_response(request_id, empty_track, "dependency_error", "kotonoha_unavailable")))
+            return 0
+        try:
+            track = _track_for_lookup(args.title, args.artist, args.album, args.duration)
+            if (args.query_title is not None or args.query_artist is not None
+                    or args.query_album is not None):
+                query_track = _normalize_query_override(
+                    args.query_title, args.query_artist, args.query_album)
+            else:
+                query_track = _track_for_lookup(args.title, args.artist, args.album, args.duration)
+            response = asyncio.run(select_entry(
+                track, request_id, args.provider, args.song_id,
+                reported_title=args.title,
+                offset_store=_TrackOffsetStore() if OFFSET_AVAILABLE else None,
+                query_track=query_track))
+        except ValueError:
+            response = _error_response(request_id, empty_track, "provider_error", "invalid_request")
+        except Exception:
+            response = _error_response(request_id, empty_track, "dependency_error", "kotonoha_unavailable")
+        print(_bounded_json(response))
+        return 0
+    if args.action == "forget":
+        try:
+            if args.request_id < 0:
+                raise ValueError("invalid_request")
+            request_id = args.request_id
+            if args.duration is not None and (not _finite(args.duration) or args.duration <= 0):
+                raise ValueError("invalid_request")
+            if args.provider not in PROVIDER_ORDER:
+                raise ValueError("invalid_request")
+            if not isinstance(args.song_id, str) or args.song_id == "":
+                raise ValueError("invalid_request")
+        except (ValueError, TypeError, argparse.ArgumentError):
+            print(_bounded_forget_json(_forget_response(request_id, "provider_error", "", "invalid_request")))
+            return 0
+        if IMPORT_ERROR is not None:
+            print(_bounded_forget_json(_forget_response(request_id, "dependency_error", "", "kotonoha_unavailable")))
+            return 0
+        try:
+            track = _track_for_lookup(args.title, args.artist, args.album, args.duration)
+        except Exception:
+            print(_bounded_forget_json(_forget_response(request_id, "provider_error", "", "invalid_request")))
+            return 0
+        response = forget_entry(request_id, args.provider, args.song_id, track=track)
+        print(_bounded_forget_json(response))
+        return 0
+    if args.action == "offset":
+        try:
+            if args.request_id < 0:
+                raise ValueError("invalid_request")
+            request_id = args.request_id
+            if not isinstance(args.key_json, str) or args.key_json == "":
+                raise ValueError("invalid_request")
+            delta = getattr(args, "delta_ms", None)
+            set_to = getattr(args, "set_ms", None)
+            if (delta is None) == (set_to is None):
+                raise ValueError("invalid_request")
+        except (ValueError, TypeError, argparse.ArgumentError):
+            print(_bounded_offset_json(_offset_response(request_id, "provider_error", 0, None, "invalid_request")))
+            return 0
+        if IMPORT_ERROR is not None and not OFFSET_AVAILABLE:
+            print(_bounded_offset_json(_offset_response(request_id, "provider_error", 0, None,
+                                             "offset_unavailable")))
+            return 0
+        try:
+            if delta is not None:
+                response = offset_write(request_id, args.key_json, delta_ms=delta)
+            else:
+                response = offset_write(request_id, args.key_json, set_ms=set_to)
+        except ValueError:
+            response = _offset_response(request_id, "provider_error", 0, None, "invalid_request")
+        except Exception:
+            response = _offset_response(request_id, "provider_error", 0, None, "kotonoha_unavailable")
+        print(_bounded_offset_json(response))
+        return 0
+    try:
+        if args.action != "fetch" or args.request_id < 0:
+            raise ValueError("invalid_request")
+        request_id = args.request_id
+        if args.duration is not None and (not _finite(args.duration) or args.duration <= 0):
+            raise ValueError("invalid_request")
+        network = str(getattr(args, "network", "auto") or "auto")
+        if network not in ("auto", "off"):
+            raise ValueError("invalid_request")
+        providers = _normalize_providers(getattr(args, "providers", None))
+        refresh = bool(getattr(args, "refresh", False))
+    except (ValueError, TypeError, argparse.ArgumentError):
+        print(_bounded_json(_error_response(request_id, empty_track, "provider_error", "invalid_request")))
+        return 0
+    if IMPORT_ERROR is not None:
+        print(_bounded_json(_error_response(request_id, empty_track, "dependency_error", "kotonoha_unavailable")))
+        return 0
+    try:
+        track = _track_for_lookup(args.title, args.artist, args.album, args.duration)
+        response = asyncio.run(fetch_lyrics(track, request_id, network=network,
+                                            providers=providers, refresh=refresh,
+                                            url=getattr(args, "url", None),
+                                            reported_title=args.title,
+                                            offset_store=_TrackOffsetStore() if OFFSET_AVAILABLE else None))
+    except Exception:
+        response = _error_response(request_id, empty_track, "dependency_error", "kotonoha_unavailable")
+    print(_bounded_json(response))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
