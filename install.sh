@@ -20,12 +20,14 @@ check_existing_plugin() {
   [[ -L "$PLUGIN_DIR" ]] && fail "$PLUGIN_DIR is a symlink; remove it or move it aside and retry"
   [[ -e "$PLUGIN_DIR" ]] || return 0
   [[ ! -L "$PLUGIN_DIR/.git" ]] || fail "$PLUGIN_DIR/.git is a symlink; move the checkout aside and retry"
+  [[ -d "$PLUGIN_DIR/.git" ]] \
+    || fail "$PLUGIN_DIR is not a standard git checkout; move it aside and retry"
   git -C "$PLUGIN_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
-    || fail "$PLUGIN_DIR exists and is not a git checkout; move it aside and retry"
+    || fail "$PLUGIN_DIR is not a valid git checkout; move it aside and retry"
   local origin
   origin="$(git -C "$PLUGIN_DIR" config --get remote.origin.url || true)"
   [[ "$origin" == "$REPO_URL" ]] \
-    || fail "$PLUGIN_DIR has unexpected origin '$origin'; expected $REPO_URL"
+    || fail "$PLUGIN_DIR has an unexpected git origin; expected the N501 Verse repository"
 }
 
 

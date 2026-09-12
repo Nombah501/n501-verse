@@ -19,9 +19,14 @@ N501 Verse is an Omarchy bar plugin that keeps the current lyric line beside the
 The recommended path is the idempotent one-command bootstrap. Review `install.sh` before running it:
 
 ```bash
-tmp="$(mktemp -d /tmp/n501-verse.XXXXXX)" && git clone --depth 1 https://github.com/Nombah501/n501-verse.git "$tmp" && bash "$tmp/install.sh"; status=$?; rm -rf "$tmp"; exit "$status"
+(
+  tmp="$(mktemp -d /tmp/n501-verse.XXXXXX)"
+  git clone --depth 1 https://github.com/Nombah501/n501-verse.git "$tmp" && bash "$tmp/install.sh"
+  status=$?
+  rm -rf "$tmp"
+  exit "$status"
+)
 ```
-
 
 The bootstrap:
 
