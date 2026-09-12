@@ -22,8 +22,13 @@ check_existing_plugin() {
   [[ ! -L "$PLUGIN_DIR/.git" ]] || fail "$PLUGIN_DIR/.git is a symlink; move the checkout aside and retry"
   [[ -d "$PLUGIN_DIR/.git" ]] \
     || fail "$PLUGIN_DIR is not a standard git checkout; move it aside and retry"
-  git -C "$PLUGIN_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+  local inside_worktree checkout_root
+  inside_worktree="$(git -C "$PLUGIN_DIR" rev-parse --is-inside-work-tree 2>/dev/null || true)"
+  [[ "$inside_worktree" == "true" ]] \
     || fail "$PLUGIN_DIR is not a valid git checkout; move it aside and retry"
+  checkout_root="$(git -C "$PLUGIN_DIR" rev-parse --show-toplevel 2>/dev/null || true)"
+  [[ "$checkout_root" == "$PLUGIN_DIR" ]] \
+    || fail "$PLUGIN_DIR is not a repository root checkout; move it aside and retry"
   local origin
   origin="$(git -C "$PLUGIN_DIR" config --get remote.origin.url || true)"
   [[ "$origin" == "$REPO_URL" ]] \
