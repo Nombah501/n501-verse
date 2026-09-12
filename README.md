@@ -16,7 +16,24 @@ N501 Verse is an Omarchy bar plugin that keeps the current lyric line beside the
 
 ## Install
 
-N501 Verse is a git-installed third-party Omarchy plugin. Install Kotonoha first and make sure it is importable by the system Python used by the plugin helper.
+The recommended path is the one-command bootstrap. Review `install.sh` before running it:
+
+```bash
+git clone --depth 1 https://github.com/Nombah501/n501-verse.git /tmp/n501-verse \
+  && bash /tmp/n501-verse/install.sh
+```
+
+The bootstrap:
+
+1. checks whether `/usr/bin/python3` can import Kotonoha;
+2. installs `kotonoha-git` from the AUR only when it is missing;
+3. validates the import again;
+4. adds or updates the git-managed plugin;
+5. places it after `tablet-mode`.
+
+It uses official Omarchy commands and never runs `pip`, `curl | bash`, or a plugin install hook. The AUR package manager may build third-party code on your system; inspect the package and script if that matters for your threat model.
+
+For a manual install, prepare Kotonoha first and then run:
 
 ```bash
 omarchy plugin add https://github.com/Nombah501/n501-verse.git --enable --yes
@@ -38,7 +55,8 @@ The plugin runs inside `omarchy-shell` as unsandboxed QML/Python code. Review th
 
 - Omarchy with third-party plugin support.
 - An active media player exposed through Omarchy's selected media service.
-- Kotonoha installed and importable by `/usr/bin/python3`.
+- An AUR helper available to `omarchy pkg aur add` for the bootstrap path.
+- Kotonoha importable by `/usr/bin/python3` after installation.
 
 No separate `playerctl` reader, player-specific integration, credentials, or plugin-owned lyrics database is required.
 
