@@ -3,9 +3,8 @@
 #
 # One explicit command installs the missing Kotonoha AUR dependency,
 # installs or updates the git-managed plugin, and places the widget
-# after tablet-mode. Run from anywhere:
-#   bash plugins/n501.karaoke/install.sh
-#
+# after tablet-mode.
+# Run `bash install.sh` from the public repository root.
 # Idempotent: fresh installs add the plugin, existing git checkouts
 # update it, and a pre-existing non-git plugin directory is refused
 # without deleting anything.
@@ -16,6 +15,19 @@ REPO_URL="https://github.com/Nombah501/n501-verse.git"
 PYTHON="/usr/bin/python3"
 AUR_PACKAGE="kotonoha-git"
 PLUGIN_DIR="$HOME/.config/omarchy/plugins/n501.karaoke"
+
+check_existing_plugin() {
+  [[ -L "$PLUGIN_DIR" ]] && fail "$PLUGIN_DIR is a symlink; remove it or move it aside and retry"
+  [[ -e "$PLUGIN_DIR" ]] || return 0
+  [[ ! -L "$PLUGIN_DIR/.git" ]] || fail "$PLUGIN_DIR/.git is a symlink; move the checkout aside and retry"
+  git -C "$PLUGIN_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+    || fail "$PLUGIN_DIR exists and is not a git checkout; move it aside and retry"
+  local origin
+  origin="$(git -C "$PLUGIN_DIR" config --get remote.origin.url || true)"
+  [[ "$origin" == "$REPO_URL" ]] \
+    || fail "$PLUGIN_DIR has unexpected origin '$origin'; expected $REPO_URL"
+}
+
 
 fail() {
   echo "install: $*" >&2
@@ -33,6 +45,7 @@ fi
 command -v omarchy >/dev/null 2>&1 || fail "omarchy command not found; run on Omarchy with omarchy installed"
 command -v git >/dev/null 2>&1 || fail "git command not found; install git and retry"
 [[ -x "$PYTHON" ]] || fail "/usr/bin/python3 not found; reinstall system python and retry"
+check_existing_plugin
 
 if "$PYTHON" -c "import kotonoha" >/dev/null 2>&1; then
   info "kotonoha already importable; skipping AUR install"
@@ -43,22 +56,20 @@ else
   info "kotonoha import OK"
 fi
 
-if [[ -L "$PLUGIN_DIR" ]]; then
-  fail "$PLUGIN_DIR is a symlink; remove it or move it aside and retry"
-elif [[ ! -e "$PLUGIN_DIR" ]]; then
+if [[ ! -e "$PLUGIN_DIR" ]]; then
   info "adding $PLUGIN_ID from $REPO_URL"
   omarchy plugin add "$REPO_URL" --enable --yes \
     || fail "could not add $PLUGIN_ID from $REPO_URL"
-elif [[ -d "$PLUGIN_DIR/.git" ]]; then
+else
   info "updating $PLUGIN_ID"
   omarchy plugin update "$PLUGIN_ID" --yes || fail "could not update $PLUGIN_ID"
   omarchy plugin enable "$PLUGIN_ID" || fail "could not enable $PLUGIN_ID"
-else
-  fail "$PLUGIN_DIR exists and is not a git checkout; move it aside and retry"
 fi
 
 info "placing $PLUGIN_ID after tablet-mode"
 omarchy bar put "$PLUGIN_ID" --after tablet-mode \
+  || fail "could not put $PLUGIN_ID on the bar"
+omarchy bar move "$PLUGIN_ID" --section left --after tablet-mode \
   || fail "could not place $PLUGIN_ID after tablet-mode"
 
 info "done: $PLUGIN_ID installed after tablet-mode"

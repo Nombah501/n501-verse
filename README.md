@@ -16,12 +16,12 @@ N501 Verse is an Omarchy bar plugin that keeps the current lyric line beside the
 
 ## Install
 
-The recommended path is the one-command bootstrap. Review `install.sh` before running it:
+The recommended path is the idempotent one-command bootstrap. Review `install.sh` before running it:
 
 ```bash
-git clone --depth 1 https://github.com/Nombah501/n501-verse.git /tmp/n501-verse \
-  && bash /tmp/n501-verse/install.sh
+tmp="$(mktemp -d /tmp/n501-verse.XXXXXX)" && git clone --depth 1 https://github.com/Nombah501/n501-verse.git "$tmp" && bash "$tmp/install.sh"; status=$?; rm -rf "$tmp"; exit "$status"
 ```
+
 
 The bootstrap:
 
@@ -38,6 +38,7 @@ For a manual install, prepare Kotonoha first and then run:
 ```bash
 omarchy plugin add https://github.com/Nombah501/n501-verse.git --enable --yes
 omarchy bar put n501.karaoke --after tablet-mode
+omarchy bar move n501.karaoke --section left --after tablet-mode
 ```
 
 The plugin keeps the technical ID `n501.karaoke` for stable configuration while presenting the product as **N501 Verse**.
