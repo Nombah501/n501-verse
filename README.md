@@ -24,14 +24,14 @@ Preview captured from the QML panel with synthetic demo metadata and lyrics.
 
 ## Install
 
-`omarchy plugin add` installs the plugin files. It does **not** run `install.sh` or install Kotonoha. If Kotonoha is not already importable by `/usr/bin/python3`, install it first:
+Install Kotonoha **0.2.3** separately using the [official v0.2.3 release](https://github.com/locez/kotonoha/releases/tag/v0.2.3) and its [installation guide](https://github.com/locez/kotonoha/blob/v0.2.3/README.md#installation). N501 Verse does not install or update Kotonoha. Check the installed distribution and import with the system Python before adding the plugin:
 
 ```bash
-omarchy pkg aur add kotonoha-git
+/usr/bin/python3 -c 'from importlib.metadata import version; print(version("kotonoha"))'
 /usr/bin/python3 -c 'import kotonoha'
 ```
 
-Then add and place the widget:
+The first command must print exactly `0.2.3`; the second must exit successfully. `omarchy plugin add` installs only the plugin files and does **not** run `install.sh`. Then add and place the widget:
 
 ```bash
 omarchy plugin add https://github.com/Nombah501/n501-verse.git --enable --yes
@@ -41,29 +41,9 @@ omarchy bar move n501.karaoke --section left --after tablet-mode
 
 The plugin keeps the technical ID `n501.karaoke` for stable configuration while presenting the product as **N501 Verse**.
 
-### Optional bootstrap
+### Optional installer
 
-If you prefer a single setup command, review `install.sh` and run it explicitly:
-
-```bash
-(
-  tmp="$(mktemp -d /tmp/n501-verse.XXXXXX)"
-  git clone --depth 1 https://github.com/Nombah501/n501-verse.git "$tmp" && bash "$tmp/install.sh"
-  status=$?
-  rm -rf "$tmp"
-  exit "$status"
-)
-```
-
-The bootstrap:
-
-1. checks whether `/usr/bin/python3` can import Kotonoha;
-2. installs `kotonoha-git` from the AUR only when it is missing;
-3. validates the import again;
-4. adds or updates the git-managed plugin;
-5. places it after `tablet-mode`.
-
-It uses Omarchy commands and runs only when you invoke it. The AUR package manager may build third-party code on your system; inspect the package and script before use.
+From a reviewed checkout, you can run `bash install.sh` instead of the three Omarchy commands above. It checks Kotonoha's installed version and import first, then adds or updates the plugin and places the widget. It never installs dependencies.
 
 ### Update or remove
 
@@ -78,8 +58,7 @@ The plugin runs inside `omarchy-shell` as unsandboxed QML/Python code. Review th
 
 - Omarchy with third-party plugin support.
 - An active media player exposed through Omarchy's selected media service.
-- An AUR helper available to `omarchy pkg aur add` if Kotonoha needs installation.
-- Kotonoha importable by `/usr/bin/python3` after installation.
+- Kotonoha distribution version `0.2.3`, separately installed and importable by `/usr/bin/python3`.
 
 No separate `playerctl` reader, player-specific integration, or credentials are required. Search corrections use a small plugin-owned SQLite database described below.
 
@@ -136,7 +115,7 @@ Provider availability, timing, rights, and correctness are not guaranteed. Netwo
 
 ### The widget reports a dependency error
 
-Install Kotonoha so its modules are importable by `/usr/bin/python3`, then rescan the shell:
+Install Kotonoha `0.2.3` from the [official release](https://github.com/locez/kotonoha/releases/tag/v0.2.3), run the version and import checks above, then rescan the shell:
 
 ```bash
 omarchy-shell shell rescanPlugins

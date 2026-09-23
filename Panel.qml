@@ -473,7 +473,7 @@ Panel {
         case "alias_store_permissions":
             return {message: "Correction storage permissions blocked removal", action: "Try again"}
         case "dependency_error":
-            return {message: "Kotonoha provider library is unavailable", action: "Copy install command"}
+            return {message: "Install Kotonoha 0.2.3 separately", action: "Select setup link"}
         case "kotonoha_unavailable":
             // Surfaces in the search/select/forget views, whose own state
             // (searchError/forgetError) is not normalized through
@@ -1735,14 +1735,14 @@ Panel {
                         width: parent.width
                         height: implicitHeight
                         textFormat: TextEdit.PlainText
-                        text: "omarchy pkg aur add kotonoha-git"
+                        text: "https://github.com/locez/kotonoha/releases/tag/v0.2.3"
                         color: Color.muted
                         font.family: root.panelFont
                         font.pixelSize: Style.font.caption
                         readOnly: true
                         selectByMouse: true
                         selectByKeyboard: true
-                        wrapMode: TextEdit.NoWrap
+                        wrapMode: TextEdit.WrapAnywhere
                         horizontalAlignment: TextEdit.AlignHCenter
                     }
                 }

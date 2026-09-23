@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
-# N501 Verse bootstrap installer.
+# Optional N501 Verse installer.
 #
-# One explicit command installs the missing Kotonoha AUR dependency,
-# installs or updates the git-managed plugin, and places the widget
-# after tablet-mode.
+# Requires Kotonoha 0.2.3 to be installed separately before it adds or
+# updates the git-managed plugin and places the widget after tablet-mode.
 # Run `bash install.sh` from the public repository root.
 # Idempotent: fresh installs add the plugin, existing git checkouts
 # update it, and a pre-existing non-git plugin directory is refused
@@ -13,7 +12,8 @@ set -euo pipefail
 PLUGIN_ID="n501.karaoke"
 REPO_URL="https://github.com/Nombah501/n501-verse.git"
 PYTHON="/usr/bin/python3"
-AUR_PACKAGE="kotonoha-git"
+KOTONOHA_VERSION="0.2.3"
+KOTONOHA_RELEASE="https://github.com/locez/kotonoha/releases/tag/v0.2.3"
 PLUGIN_DIR="$HOME/.config/omarchy/plugins/n501.karaoke"
 
 check_existing_plugin() {
@@ -54,14 +54,13 @@ command -v git >/dev/null 2>&1 || fail "git command not found; install git and r
 [[ -x "$PYTHON" ]] || fail "/usr/bin/python3 not found; reinstall system python and retry"
 check_existing_plugin
 
-if "$PYTHON" -c "import kotonoha" >/dev/null 2>&1; then
-  info "kotonoha already importable; skipping AUR install"
-else
-  info "installing $AUR_PACKAGE"
-  omarchy pkg aur add "$AUR_PACKAGE" || fail "could not install $AUR_PACKAGE; run 'omarchy pkg aur add $AUR_PACKAGE' manually and retry"
-  "$PYTHON" -c "import kotonoha" >/dev/null 2>&1 || fail "kotonoha still not importable by /usr/bin/python3 after installing $AUR_PACKAGE; run 'omarchy pkg aur add $AUR_PACKAGE' manually and retry"
-  info "kotonoha import OK"
-fi
+installed_version="$("$PYTHON" -c 'from importlib.metadata import version; print(version("kotonoha"))' 2>/dev/null)" \
+  || fail "install Kotonoha $KOTONOHA_VERSION separately for $PYTHON before adding this plugin; see $KOTONOHA_RELEASE"
+[[ "$installed_version" == "$KOTONOHA_VERSION" ]] \
+  || fail "Kotonoha $KOTONOHA_VERSION required, found $installed_version; install the matching release separately: $KOTONOHA_RELEASE"
+"$PYTHON" -c 'import kotonoha' >/dev/null 2>&1 \
+  || fail "Kotonoha $KOTONOHA_VERSION is installed but cannot be imported by $PYTHON; repair that installation before adding this plugin"
+info "Kotonoha $KOTONOHA_VERSION available"
 
 if [[ ! -e "$PLUGIN_DIR" ]]; then
   info "adding $PLUGIN_ID from $REPO_URL"
