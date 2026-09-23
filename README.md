@@ -8,6 +8,10 @@ N501 Verse is an Omarchy bar plugin that keeps the current lyric line beside the
 
 Preview captured from the QML panel with synthetic demo metadata and lyrics.
 
+**Bar in motion:** synchronized words fill as the track plays, then the next line appears. Recorded from the QML widget with synthetic demo lyrics.
+
+![Animated N501 Verse bar filling karaoke words and advancing to the next line](bar-demo.gif)
+
 ## Why N501 Verse
 
 - **Native to Omarchy** — a real bar widget and panel, not a separate overlay competing with the shell.
