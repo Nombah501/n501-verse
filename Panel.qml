@@ -28,6 +28,7 @@ Panel {
         if (isFinite(legacyWidth) && legacyWidth >= 650) return "expanded"
         return "standard"
     }
+    readonly property bool motionEnabled: setting("motionEnabled", true) !== false
     readonly property int configuredWidth: root.layoutMode === "compact" ? 320
         : (root.layoutMode === "expanded" ? 720 : 520)
     readonly property int slotWidth: vertical ? barSize : configuredWidth
@@ -40,22 +41,27 @@ Panel {
         ? String(karaokeService.activePlayer.trackArtist || "") : ""
     readonly property string titleName: karaokeService && karaokeService.activePlayer
         ? String(karaokeService.activePlayer.trackTitle || "") : ""
+    // Timing is claimed only for a ready document with real word/line timing.
     readonly property string syncLabel: {
-        if (karaokeService && karaokeService.timing === "word" && karaokeService.timingDetail === "mixed")
-            return "Word + line"
-        return karaokeService && karaokeService.timing === "word" ? "Word sync" : "Line sync"
+        if (!root.ready || !karaokeService) return ""
+        if (karaokeService.timing === "word")
+            return karaokeService.timingDetail === "mixed" ? "Word + line" : "Word sync"
+        return karaokeService.timing === "line" ? "Line sync" : ""
     }
+    // The tooltip is the only text on a vertical bar: every state says what it is.
     readonly property string tooltipText: {
         var label = root.artistName + (root.artistName && root.titleName ? " — " : "") + root.titleName
         if (label === "") return ""
-        var text = label + " (" + root.syncLabel + ")"
-        var line = karaokeService && karaokeService.currentLine
-            && typeof karaokeService.currentLine.text === "string"
-            ? karaokeService.currentLine.text : ""
-        if (line !== "") text += "\n" + line
+        var text = root.syncLabel !== "" ? label + " (" + root.syncLabel + ")" : label
         if (root.ready) {
+            var line = karaokeService && karaokeService.currentLine
+                && typeof karaokeService.currentLine.text === "string"
+                ? karaokeService.currentLine.text : ""
+            if (line !== "") text += "\n" + line
             text += "\nClick: panel · Right: refresh · Middle: search"
             if (root.offsetControlsAvailable) text += " · Wheel: timing"
+        } else if (root.serviceState === "loading") {
+            text += "\nLoading synchronized lyrics…"
         } else if (root.failureVisible) {
             text += "\n" + root.failureMessage
         }
@@ -64,7 +70,6 @@ Panel {
     // Native music glyph shared by the bar surface and the panel hero fallback.
     readonly property string musicGlyph: "󰎆"
     readonly property string verticalGlyph: {
-        if (root.serviceState === "loading") return "…"
         if (root.serviceState === "not_found") return "○"
         if (root.serviceState === "provider_error" || root.serviceState === "dependency_error") return "!"
         return root.musicGlyph
@@ -77,26 +82,37 @@ Panel {
     readonly property real openPanelIndicatorWidth: {
         if (!visible) return 0
         if (vertical) return barSize
-        if (lineItem.visible) return Math.max(1, Math.min(configuredWidth, lineItem.fullWidth))
-        if (interludeVisual.visible) return Math.max(1, Math.min(configuredWidth, interludeVisual.width))
-        if (loadingText.visible) return Math.max(1, loadingText.implicitWidth)
+        if (lineItem.visible)
+            return Math.max(1, Math.min(configuredWidth, lineItem.fullWidth))
+        if (loadingSnapshotItem.visible)
+            return Math.max(1, Math.min(configuredWidth, loadingSnapshotItem.implicitWidth))
+        if (root.barTraceVisible) return Math.min(configuredWidth, 104)
         if (glyphText.visible) return Math.max(1, glyphText.implicitWidth)
-        if (markerText.visible) return Math.max(1, markerText.implicitWidth)
         return configuredWidth
     }
-    readonly property real openPanelIndicatorHeight: barSize
+    // Vertical bars read this extent: track the painted glyph, never the slot.
+    readonly property real openPanelIndicatorHeight: {
+        if (!visible) return 0
+        if (vertical && glyphText.visible) return Math.max(1, Math.min(barSize, glyphText.implicitHeight))
+        return barSize
+    }
     readonly property alias button: barButton
     readonly property alias catcher: keyCatcher
     readonly property alias installCommandField: installCommand
     readonly property alias failureGlyphText: failureGlyph.text
+    readonly property bool barGlyphVisible: glyphText.visible
     readonly property alias failurePrimaryButton: failurePrimaryButton
     readonly property alias failureDetailsButton: failureDetailsButton
+    // The lyric clip keeps its size across line and progress states.
+    readonly property alias lyricClipItem: lineItem
     // Public observable for popup sizing: the smoke asserts the panel
     // content width follows the configured bar mode.
     readonly property alias popupContentWidth: popup.contentWidth
     // Public observable for the deferred search-title focus path: smoke and
     // keybindings assert this instead of reaching into private field ids.
     readonly property alias searchTitleField: titleField
+    readonly property alias searchArtistField: artistField
+    readonly property alias searchAlbumField: albumField
     readonly property bool searchTitleFocused: titleField.activeFocus
     // Set by middle click or the `/` key; the search view never owns the document.
     property bool searchMode: false
@@ -120,7 +136,6 @@ Panel {
     property bool offsetWritePending: false
     property bool offsetFlashVisible: false
     property bool showDiagnostics: false
-    property int capabilitiesClock: 0
     property real wheelRemainder: 0
     readonly property var lyricDocument: karaokeService && karaokeService.document ? karaokeService.document : null
     readonly property string provenanceLabel: {
@@ -261,37 +276,87 @@ Panel {
         && karaokeService.activePlayer.canSeek === true
         && karaokeService.activePlayer.positionSupported === true
     readonly property string seekHint: root.seekSupported ? "" : "Seeking is unavailable for this player"
-    // Playback-reactive decoration: restrained, overlay-only, never layout.
-    // rhythmPulseVisible covers the neon bar visual; interludeVisualVisible
-    // covers the orbit visual for >4s gaps (model threshold, projectionState).
-    // motionVisible gates all nonessential bar motion: a hidden, idle-collapsed,
-    // or otherwise invisible bar never advances phase/rotation or shows overlay
-    // visuals. Imperative breath cues reset via manageBarMotion on barHidden
-    // changes; running-bound tick/spin stop via these bindings.
-    property real rhythmPhase: 0
+    // Lyrics own the motion. A small trace reports timing only when no line is
+    // due; loading is the sole indeterminate state.
+    property real loadingPhase: 0
+    property string lastVisibleLineText: ""
+    property string loadingSnapshotText: ""
+    property string lastVisibleTitle: ""
+    property string lastVisibleArtist: ""
+    property string loadingSnapshotTitle: ""
+    property string loadingSnapshotArtist: ""
+    property bool loadingHandoffPending: false
+    property bool loadingMotionReady: false
+    property bool loadingLabelReady: false
     readonly property bool motionVisible: root.visible && !(root.bar && root.bar.barHidden === true)
-    readonly property real orbitRotation: interludeOrbit.rotation
     readonly property bool isPlaying: !!karaokeService && !!karaokeService.activePlayer
         && karaokeService.activePlayer.isPlaying === true
-    readonly property real rhythmProgress: {
-        if (!root.karaokeService || !root.karaokeService.currentLine) return 0
-        if (!lineItem || lineItem.hasWordTiming !== true) return 0.5
-        var w = Number(lineItem.wordProgress)
-        if (!(w >= 0)) return 0
-        if (w < 0) return 0
-        if (w > 1) return 1
-        return w
+    readonly property string projectionState: root.karaokeService
+        ? String(root.karaokeService.projectionState || "") : ""
+    readonly property bool beforeFirstSceneVisible: root.projectionState === "before_first"
+        && root.karaokeService
+        && Number(root.karaokeService.leadInDuration || 0)
+            - KaraokeModel.interludeThreshold() > 1e-9
+    readonly property bool loadingHandoffVisible: root.serviceState === "loading"
+        && root.loadingHandoffPending && !root.loadingMotionReady
+    readonly property bool loadingSnapshotVisible: !root.vertical
+        && root.loadingHandoffVisible && root.loadingSnapshotText !== ""
+    readonly property bool timedGapVisible: root.ready
+        && (root.beforeFirstSceneVisible || root.projectionState === "interlude")
+    readonly property bool barTraceVisible: root.motionVisible && !root.vertical
+        && ((root.serviceState === "loading" && root.loadingMotionReady)
+            || root.timedGapVisible)
+    readonly property bool finalFailure: ["not_found", "provider_error", "dependency_error"]
+        .indexOf(root.serviceState) >= 0
+    readonly property bool popupTraceVisible: root.opened && !root.searchMode
+        && ((root.serviceState === "loading" && root.loadingMotionReady)
+            || root.timedGapVisible)
+    readonly property bool popupLoadingSnapshotVisible: root.opened
+        && root.loadingHandoffVisible && !root.searchMode
+    readonly property bool loadingTraceRunning: root.motionEnabled && root.motionVisible
+        && root.isPlaying && root.serviceState === "loading" && root.loadingMotionReady
+    readonly property real traceProgress: {
+        if (!root.karaokeService) return 0
+        if (root.projectionState === "before_first")
+            return root.clamp01(Number(root.karaokeService.leadInProgress || 0))
+        if (root.projectionState === "interlude")
+            return root.clamp01(Number(root.karaokeService.interludeProgress || 0))
+        return 0
     }
-    readonly property bool rhythmPulseVisible: root.motionVisible && !root.vertical && root.ready && root.isPlaying
-        && root.karaokeService && !!root.karaokeService.currentLine
-    readonly property bool interludeVisualVisible: root.motionVisible && !root.vertical && root.ready && root.karaokeService
-        && String(root.karaokeService.projectionState || "") === "interlude"
+    function clamp01(value) {
+        var number = Number(value)
+        if (!isFinite(number) || number <= 0) return 0
+        return number >= 1 ? 1 : number
+    }
 
     property bool followEnabled: true
     property bool autoFollowing: false
 
+    // Pushes the CURRENT settings to the service right now. Called directly
+    // (synchronously) whenever `settings` itself just changed -- including
+    // construction -- since at that point `settings` already holds the
+    // caller's deliberate value.
     function pushSettings() {
         if (karaokeService && typeof karaokeService.configure === "function") karaokeService.configure(settings)
+    }
+    // The host (Bar.qml injectProps) sets `bar` before `settings`, so the
+    // instant `bar` changes (and karaokeService resolves) `settings` may
+    // still be Ui/Panel.qml's `({})` placeholder default -- including for a
+    // second (or later) panel instance bound after the service already has
+    // real settings applied, e.g. monitor hotplug or the widget moved/
+    // re-added. Pushing that placeholder straight through configure() would
+    // toggle an already-settled service (e.g. Offline) back to the Auto/
+    // all-providers default and immediately start a lookup, which the real
+    // settings assignment that follows in the same synchronous injectProps()
+    // turn then cancels -- wiping and refetching a document that never
+    // needed it. Deferring via Qt.callLater means this reads `settings`
+    // again only once that follow-up assignment has landed, so it always
+    // pushes the turn's real value rather than the placeholder; an ordinary
+    // settings-only change (no `bar` change alongside it, e.g. an edited
+    // shell.json entry or cycleLayoutMode) never goes through this deferred
+    // path at all and keeps pushing synchronously via pushSettings() above.
+    function deferredPushSettings() {
+        Qt.callLater(root.pushSettings)
     }
     // Direct bar-size control: the next enum in fixed Compact → Standard →
     // Expanded → Compact order, title-cased for the manifest enum. The copy
@@ -385,12 +450,20 @@ Panel {
             return {message: "Lyrics provider returned unusable data", action: "Try again"}
         case "invalid_payload":
             return {message: "Lyrics provider returned unusable data", action: "Try again"}
+        case "invalid_request":
+            return {message: "Lyrics request was invalid", action: "Try again"}
         case "payload_too_large":
             return {message: "Lyrics response is too large", action: "Try again"}
         case "selection_not_found":
             return {message: "That lyrics version is no longer available", action: "Search again"}
         case "offset_store_failed":
             return {message: "Could not save timing offset", action: "Retry offset"}
+        case "offset_unavailable":
+            return {message: "Timing offset is unavailable", action: "Try again"}
+        case "search_failed":
+            return {message: "Lyrics search failed", action: "Try again"}
+        case "search_unavailable":
+            return {message: "Search is unavailable for this provider", action: "Try again"}
         case "cache_delete_failed":
             return {message: "Could not remove cached lyrics", action: "Try again"}
         case "cache_store_failed":
@@ -401,6 +474,11 @@ Panel {
             return {message: "Correction storage permissions blocked removal", action: "Try again"}
         case "dependency_error":
             return {message: "Kotonoha provider library is unavailable", action: "Copy install command"}
+        case "kotonoha_unavailable":
+            // Surfaces in the search/select/forget views, whose own state
+            // (searchError/forgetError) is not normalized through
+            // failureKey/dependency_error the way the main fetch view is.
+            return {message: "Kotonoha provider library is unavailable", action: "Try again"}
         default:
             return {message: "No synchronized lyrics found", action: "Try again"}
         }
@@ -519,6 +597,31 @@ Panel {
         })
     }
 
+    // Tab/Backtab while a query field holds focus: the key catcher is
+    // `blocked` for the whole field-editing duration (see keyCatcher below),
+    // so it never sees these keys itself. Each field forwards them here
+    // instead of letting them fall on the floor. Within the three fields,
+    // Tab/Backtab simply move to the next/previous field. At either edge
+    // (Backtab from title, Tab from album) focus hands back to the key
+    // catcher, the same way Escape already does, so a further Tab/Backtab
+    // reaches the catcher unblocked and calls switchPanel, which opens the
+    // neighbouring bar widget's panel (host Bar.qml switchPanelFrom) --
+    // not a section within this panel.
+    function focusAdjacentQueryField(direction) {
+        var fields = [titleField, artistField, albumField]
+        var current = 0
+        for (var i = 0; i < fields.length; i++) {
+            if (fields[i].activeFocus) { current = i; break }
+        }
+        var next = current + direction
+        if (next < 0 || next >= fields.length) {
+            keyCatcher.forceActiveFocus()
+            return
+        }
+        root.setCursor("query", next)
+        fields[next].forceActiveFocus()
+    }
+
     function openSearch() {
         // Seed once per search-view entry: repeated entry while already
         // searching (e.g. pressing `/` again) must not overwrite unsent
@@ -590,20 +693,25 @@ Panel {
         root.searchProvider = list[next]
     }
 
+    // Pending is set before the call (a synchronous result may land inside
+    // it) and restored when the service reports it dispatched nothing, so a
+    // refused write never strands the controls; an in-flight write stays pending.
     function requestOffsetDelta(deltaMs) {
         var svc = root.karaokeService
         if (!svc || typeof svc.nudgeOffset !== "function") return
         if (!root.offsetControlsAvailable) return
+        var wasPending = root.offsetWritePending
         root.offsetWritePending = true
-        svc.nudgeOffset(deltaMs)
+        if (svc.nudgeOffset(deltaMs) === false) root.offsetWritePending = wasPending
     }
 
     function requestOffsetReset() {
         var svc = root.karaokeService
         if (!svc || typeof svc.resetOffset !== "function") return
         if (!root.offsetControlsAvailable) return
+        var wasPending = root.offsetWritePending
         root.offsetWritePending = true
-        svc.resetOffset()
+        if (svc.resetOffset() === false) root.offsetWritePending = wasPending
     }
 
     function showOffsetFlash() {
@@ -1016,12 +1124,16 @@ Panel {
         return parts.length > 0 ? "Providers: " + parts.join(" · ") : ""
     }
 
-    readonly property bool capabilitiesStale: {
-        root.capabilitiesClock
+    // True only when capabilities are actually unavailable (no capabilities
+    // object, or a reported capabilitiesError) -- never merely because the
+    // 60 s capabilitiesFresh() window lapsed. That freshness window still
+    // governs background re-probe decisions (e.g. openSearch()'s force
+    // probe) through svc.capabilitiesFresh() directly; it is unrelated to
+    // whether "Retry capabilities" should be offered.
+    readonly property bool capabilitiesUnavailable: {
         var svc = root.karaokeService
-        if (!svc || typeof svc.capabilitiesFresh !== "function") return !svc || !svc.capabilities
-        if (typeof svc.capabilitiesError === "string" && svc.capabilitiesError !== "") return true
-        return !svc.capabilitiesFresh()
+        if (!svc || !svc.capabilities) return true
+        return typeof svc.capabilitiesError === "string" && svc.capabilitiesError !== ""
     }
 
     function retryCapabilities() {
@@ -1029,63 +1141,49 @@ Panel {
             root.karaokeService.probeCapabilities(true)
     }
 
-    // Bar motion orchestration: every cue is cancellable; rapid state changes
-    // stop all motion and reset final values before starting the one cue that
-    // matches the new state. Transform/opacity only, never slot width.
-    // The orbit spin and rhythm tick are running-bound so they stop when
-    // hidden/non-ready/paused without breaking their bindings here. Hidden or
-    // otherwise invisible bars never restart an imperative cue.
-    function resetBarMotion() {
-        lineFadeIn.stop()
-        content.opacity = 1
-        if (lyricFader) lyricFader.opacity = 1
-        leadInCue.stop()
-        interludeBreath.stop()
-        afterLastSettle.stop()
-        loadingBreath.stop()
-        verticalLoadingBreath.stop()
-        notFoundPulse.stop()
-        if (lineItem) lineItem.scale = 1
-        if (interludeVisual) {
-            interludeVisual.opacity = 1
-            interludeVisual.scale = 1
+    component ProgressTrace: Item {
+        id: trace
+        property color accentColor: Color.accent
+        property color mutedColor: Color.muted
+        property real progress: 0
+        property bool busy: false
+        property real busyPhase: 0
+        readonly property real busyStart: -20 + trace.busyPhase * (trace.width + 20)
+        readonly property real head: trace.busy
+            ? trace.busyStart + 20
+            : trace.width * trace.progress
+        enabled: false
+        height: 10
+        clip: true
+        Rectangle {
+            id: rail
+            anchors.centerIn: parent
+            width: parent.width
+            height: 3
+            radius: 1.5
+            color: trace.mutedColor
+            opacity: 0.5
         }
-        if (markerText) {
-            markerText.opacity = 1
-            markerText.scale = 1
+        Rectangle {
+            x: trace.busy ? trace.busyStart : 0
+            anchors.verticalCenter: rail.verticalCenter
+            width: trace.busy ? 20 : trace.head
+            height: rail.height
+            radius: rail.radius
+            color: trace.accentColor
+            opacity: 0.9
         }
-        if (loadingText) {
-            loadingText.opacity = 1
-            loadingText.scale = 1
-        }
-        if (glyphText) {
-            glyphText.opacity = 1
-            glyphText.scale = 1
+        Rectangle {
+            x: trace.busy ? trace.head - width / 2
+                : Math.max(0, Math.min(trace.width - width, trace.head - width / 2))
+            anchors.verticalCenter: rail.verticalCenter
+            width: 5
+            height: 5
+            radius: 2.5
+            color: trace.accentColor
+            visible: trace.busy || trace.progress > 0
         }
     }
-    function manageBarMotion() {
-        root.resetBarMotion()
-        if (!root.motionVisible) return
-        if (root.vertical) {
-            if (root.serviceState === "loading" && glyphText.visible) verticalLoadingBreath.restart()
-            else if (root.serviceState === "not_found" && glyphText.visible) notFoundPulse.restart()
-            return
-        }
-        if (root.serviceState === "loading") {
-            if (loadingText.visible) loadingBreath.restart()
-            return
-        }
-        if (root.serviceState === "not_found") {
-            if (glyphText.visible) notFoundPulse.restart()
-            return
-        }
-        if (root.serviceState !== "ready" || !root.karaokeService) return
-        var projection = String(root.karaokeService.projectionState || "")
-        if (projection === "before_first" && lineItem.visible) leadInCue.restart()
-        else if (projection === "interlude" && interludeVisual.visible && root.isPlaying) interludeBreath.restart()
-        else if (projection === "after_last" && markerText.visible) afterLastSettle.restart()
-    }
-
 
     WidgetButton {
         id: barButton
@@ -1095,6 +1193,8 @@ Panel {
         fixedHeight: root.barSize
         keepSpace: true
         text: ""
+        // The full-slot button is a hit area with separately painted content.
+        hasVisualContent: true
         tooltipText: root.tooltipText
         onPressed: function(code) {
             if (code === Qt.RightButton) root.secondaryAction()
@@ -1111,271 +1211,137 @@ Panel {
         anchors.fill: parent
         clip: true
 
+        ProgressTrace {
+            id: barTrace
+            anchors.centerIn: parent
+            width: 104
+            visible: root.barTraceVisible
+            busy: root.serviceState === "loading"
+            busyPhase: root.motionEnabled ? root.loadingPhase : 0.5
+            progress: root.traceProgress
+            accentColor: Color.accent
+            mutedColor: root.bar ? root.bar.barForeground : Color.bar.text
+        }
+
         Text {
             id: glyphText
             anchors.centerIn: parent
-            visible: root.vertical || !root.ready && root.serviceState !== "loading"
-            transformOrigin: Item.Center
+            visible: root.vertical || root.finalFailure
+                || (root.ready && root.projectionState === "before_first"
+                    && !root.beforeFirstSceneVisible)
+                || (root.ready && root.projectionState === "after_last")
             textFormat: Text.PlainText
             text: root.verticalGlyph
-            color: root.serviceState === "provider_error" || root.serviceState === "dependency_error"
-                || root.serviceState === "not_found" ? Color.muted
+            color: root.finalFailure ? Color.muted
                 : (root.bar ? root.bar.barForeground : Color.bar.text)
             font.family: root.bar ? root.bar.fontFamily : Style.font.family
             font.pixelSize: Style.font.body
         }
 
         Text {
-            id: loadingText
+            id: loadingSnapshotItem
             anchors.centerIn: parent
-            visible: !root.vertical && root.serviceState === "loading"
-            transformOrigin: Item.Center
+            visible: root.loadingSnapshotVisible && opacity > 0
             textFormat: Text.PlainText
-            text: "…"
+            text: root.loadingSnapshotText
             color: root.bar ? root.bar.barForeground : Color.bar.text
             font.family: root.bar ? root.bar.fontFamily : Style.font.family
             font.pixelSize: Style.font.body
+            elide: Text.ElideRight
+            width: Math.max(0, root.configuredWidth - Style.spacing.md * 2)
+            horizontalAlignment: Text.AlignHCenter
         }
 
-        Item {
-            id: lyricFader
+        KaraokeLine {
+            id: lineItem
+            visible: !root.vertical && root.ready && root.projectionState === "line"
+                && root.karaokeService && !!root.karaokeService.currentLine
             anchors.fill: parent
-
-            KaraokeLine {
-                id: lineItem
-                visible: !root.vertical && root.ready && root.karaokeService && !!root.karaokeService.currentLine
-                anchors.fill: parent
-                anchors.leftMargin: Style.spacing.md
-                opacity: root.karaokeService
-                    && root.karaokeService.projectionState === "before_first" ? 0.55 : 1
-                transformOrigin: Item.Center
-                line: root.karaokeService ? root.karaokeService.currentLine : null
-                position: root.karaokeService && typeof root.karaokeService.position === "number"
-                    ? root.karaokeService.position : 0
-                wordTiming: root.karaokeService ? root.karaokeService.timing === "word" : false
-                playing: root.karaokeService && root.karaokeService.activePlayer
-                    ? root.karaokeService.activePlayer.isPlaying === true : false
-                foreground: root.bar ? root.bar.barForeground : Color.bar.text
-                muted: Color.muted
-                fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
-                fontSize: Style.font.body
-
-                Behavior on opacity {
-                    NumberAnimation { duration: 140; easing.type: Easing.OutCubic }
-                }
-            }
-
-            Text {
-                id: markerText
-                anchors.centerIn: parent
-                visible: !root.vertical && root.ready && root.karaokeService
-                    && root.karaokeService.projectionState === "after_last"
-                transformOrigin: Item.Center
-                textFormat: Text.PlainText
-                text: "· · ·"
-                color: Color.muted
-                font.family: root.bar ? root.bar.fontFamily : Style.font.family
-                font.pixelSize: Style.font.body
-            }
-            // Constellation interlude: central accent dot plus three orbiters on
-            // a slow rotation with a cancellable breathing cue. Overlay-only;
-            // the after-last text marker above stays unchanged.
-            Item {
-                id: interludeVisual
-                anchors.centerIn: parent
-                width: 52
-                height: 18
-                visible: root.interludeVisualVisible
-                transformOrigin: Item.Center
-                Rectangle {
-                    anchors.centerIn: parent
-                    width: 6
-                    height: 6
-                    radius: 3
-                    color: Color.accent
-                    opacity: 0.9
-                }
-                Item {
-                    id: interludeOrbit
-                    anchors.centerIn: parent
-                    width: 44
-                    height: 16
-                    transformOrigin: Item.Center
-                    Repeater {
-                        model: 3
-                        Rectangle {
-                            required property int index
-                            width: index === 2 ? 3 : 4
-                            height: index === 2 ? 3 : 4
-                            radius: width / 2
-                            color: index === 0 ? Color.accent : Color.muted
-                            opacity: 0.75
-                            x: index === 0 ? 0 : (index === 1 ? 40 : 20)
-                            y: index === 2 ? 0 : 6
-                        }
-                    }
-                }
-                NumberAnimation {
-                    id: orbitSpin
-                    target: interludeOrbit
-                    property: "rotation"
-                    from: 0
-                    to: 360
-                    duration: 6000
-                    loops: Animation.Infinite
-                    easing.type: Easing.Linear
-                    running: root.motionVisible && root.interludeVisualVisible && root.isPlaying
-                }
-            }
-        }
-        // Playback-reactive rhythm overlay: six small bars at the
-        // bottom-right, driven by word progress plus a slow tick phase.
-        // Overlay-only; lyric geometry and slot width never move. Lives outside
-        // lyricFader so the per-line 140 ms fade never blinks the pulse.
-        Item {
-            id: rhythmPulse
-            anchors.fill: parent
-            visible: root.rhythmPulseVisible
-            opacity: 0.6
-            enabled: false
-            Row {
-                anchors.right: parent.right
-                anchors.bottom: parent.bottom
-                anchors.rightMargin: 8
-                anchors.bottomMargin: 5
-                spacing: 2
-                height: 12
-                Repeater {
-                    model: 6
-                    Rectangle {
-                        required property int index
-                        width: 3
-                        radius: 1
-                        color: index % 2 === 0 ? Color.accent : Color.muted
-                        height: {
-                            var boost = 0.35 + 0.65 * root.rhythmProgress
-                            var wave = Math.abs(Math.sin((root.rhythmPhase + index * 0.17) * Math.PI * 2))
-                            var level = 0.15 + 0.85 * (0.3 + 0.7 * wave) * (0.45 + 0.55 * boost)
-                            if (!(level >= 0)) level = 0
-                            if (level > 1) level = 1
-                            return 3 + 9 * level
-                        }
-                        anchors.bottom: parent.bottom
-                        opacity: 0.75
-                        Behavior on height {
-                            NumberAnimation { duration: 140; easing.type: Easing.OutCubic }
-                        }
-                    }
-                }
-            }
+            anchors.leftMargin: Style.spacing.md
+            anchors.rightMargin: Style.spacing.md
+            opacity: root.isPlaying ? 1 : 0.72
+            line: root.karaokeService ? root.karaokeService.currentLine : null
+            position: root.karaokeService && typeof root.karaokeService.position === "number"
+                ? root.karaokeService.position : 0
+            wordTiming: root.karaokeService ? root.karaokeService.timing === "word" : false
+            playing: root.isPlaying
+            foreground: root.bar ? root.bar.barForeground : Color.bar.text
+            muted: Color.muted
+            fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
+            fontSize: Style.font.body
         }
 
-        // Cancellable fade-in-only cue for a newly selected lyric/marker.
         NumberAnimation {
-            id: lineFadeIn
-            target: lyricFader
+            id: loadingSnapshotFade
+            target: loadingSnapshotItem
             property: "opacity"
-            from: 0
-            to: 1
-            duration: 140
+            from: 1
+            to: 0
+            duration: 250
             easing.type: Easing.OutCubic
             running: false
-        }
-        // One-shot lead-in cue for the upcoming first line. Scale only; the
-        // real word fill stays untouched and the slot width is never animated.
-        NumberAnimation {
-            id: leadInCue
-            target: lineItem
-            property: "scale"
-            from: 0.94
-            to: 1
-            duration: 220
-            easing.type: Easing.OutCubic
-            running: false
-        }
-        // Instrumental gaps get a compact constellation breathing cue.
-        SequentialAnimation {
-            id: interludeBreath
-            running: false
-            loops: Animation.Infinite
-            ParallelAnimation {
-                NumberAnimation { target: interludeVisual; property: "opacity"; to: 1; duration: 620; easing.type: Easing.InOutSine }
-                NumberAnimation { target: interludeVisual; property: "scale"; to: 1.08; duration: 620; easing.type: Easing.InOutSine }
+            onFinished: {
+                loadingSnapshotItem.opacity = 0
+                root.loadingSnapshotText = ""
+                root.loadingSnapshotTitle = ""
+                root.loadingSnapshotArtist = ""
             }
-            ParallelAnimation {
-                NumberAnimation { target: interludeVisual; property: "opacity"; to: 0.45; duration: 620; easing.type: Easing.InOutSine }
-                NumberAnimation { target: interludeVisual; property: "scale"; to: 0.96; duration: 620; easing.type: Easing.InOutSine }
-            }
-        }
-        // The end marker settles once, then remains visible.
-        ParallelAnimation {
-            id: afterLastSettle
-            running: false
-            NumberAnimation { target: markerText; property: "opacity"; from: 0.25; to: 1; duration: 420; easing.type: Easing.OutCubic }
-            NumberAnimation { target: markerText; property: "scale"; from: 0.88; to: 1; duration: 420; easing.type: Easing.OutBack }
-        }
-        // Loading stays alive via a visible breathing cue.
-        SequentialAnimation {
-            id: loadingBreath
-            running: false
-            loops: Animation.Infinite
-            ParallelAnimation {
-                NumberAnimation { target: loadingText; property: "opacity"; to: 0.35; duration: 520; easing.type: Easing.InOutSine }
-                NumberAnimation { target: loadingText; property: "scale"; to: 1.1; duration: 520; easing.type: Easing.InOutSine }
-            }
-            ParallelAnimation {
-                NumberAnimation { target: loadingText; property: "opacity"; to: 1; duration: 520; easing.type: Easing.InOutSine }
-                NumberAnimation { target: loadingText; property: "scale"; to: 1; duration: 520; easing.type: Easing.InOutSine }
-            }
-        }
-        // Vertical loading uses the centered glyph; same breathing language.
-        SequentialAnimation {
-            id: verticalLoadingBreath
-            running: false
-            loops: Animation.Infinite
-            ParallelAnimation {
-                NumberAnimation { target: glyphText; property: "opacity"; to: 0.35; duration: 560; easing.type: Easing.InOutSine }
-                NumberAnimation { target: glyphText; property: "scale"; to: 1.1; duration: 560; easing.type: Easing.InOutSine }
-            }
-            ParallelAnimation {
-                NumberAnimation { target: glyphText; property: "opacity"; to: 1; duration: 560; easing.type: Easing.InOutSine }
-                NumberAnimation { target: glyphText; property: "scale"; to: 1; duration: 560; easing.type: Easing.InOutSine }
-            }
-        }
-        // Brief entrance pulse for no-lyrics; copy/action untouched.
-        ParallelAnimation {
-            id: notFoundPulse
-            running: false
-            NumberAnimation { target: glyphText; property: "opacity"; from: 0.2; to: 1; duration: 360; easing.type: Easing.OutCubic }
-            NumberAnimation { target: glyphText; property: "scale"; from: 0.82; to: 1; duration: 360; easing.type: Easing.OutBack }
         }
     }
 
     onShownKeyChanged: {
-        root.manageBarMotion()
-        if (root.ready && !root.vertical) {
-            lineFadeIn.stop()
-            lyricFader.opacity = 0
-            lineFadeIn.start()
+        var line = root.ready && root.projectionState === "line" && root.karaokeService
+            ? root.karaokeService.currentLine : null
+        var nextText = line ? String(line.text || "") : ""
+        if (nextText !== "") {
+            root.lastVisibleLineText = nextText
+            root.lastVisibleTitle = root.titleName
+            root.lastVisibleArtist = root.artistName
         }
     }
     onServiceStateChanged: {
         button.hideOwnTooltip()
+        loadingRevealTimer.stop()
+        loadingLabelTimer.stop()
+        root.loadingMotionReady = false
+        root.loadingLabelReady = false
         if (serviceState === "idle") root.close()
         if (serviceState === "loading") {
-            // A new lookup invalidates search context and the offset flash.
+            // Keep the outgoing lyric briefly while loading starts. A quick
+            // result draws its due lyric at full opacity immediately.
+            loadingSnapshotFade.stop()
+            var hasOutgoingComposition = root.lastVisibleLineText !== ""
+                || root.lastVisibleTitle !== "" || root.lastVisibleArtist !== ""
+            root.loadingSnapshotText = root.lastVisibleLineText
+            root.loadingSnapshotTitle = hasOutgoingComposition && root.lastVisibleTitle !== ""
+                ? root.lastVisibleTitle : root.titleName
+            root.loadingSnapshotArtist = hasOutgoingComposition && root.lastVisibleArtist !== ""
+                ? root.lastVisibleArtist : root.artistName
+            root.loadingHandoffPending = true
+            root.loadingPhase = 0
+            loadingSnapshotItem.opacity = root.loadingSnapshotText !== "" ? 1 : 0
+            if (root.loadingSnapshotText !== "") loadingSnapshotFade.start()
+            loadingRevealTimer.restart()
+            loadingLabelTimer.restart()
             root.searchMode = false
             root.showDiagnostics = false
             root.cursorActive = false
             root.offsetWritePending = false
             root.offsetFlashVisible = false
-        } else root.resetPanelCursor()
-        root.manageBarMotion()
+        } else {
+            if (root.ready) {
+                root.lastVisibleTitle = root.titleName
+                root.lastVisibleArtist = root.artistName
+            }
+            root.resetPanelCursor()
+            if (root.ready && root.loadingHandoffPending && !root.vertical) {
+                handoffReleaseTimer.restart()
+            }
+            if (!root.ready) root.loadingHandoffPending = false
+        }
     }
-    onKaraokeServiceChanged: root.pushSettings()
+    onKaraokeServiceChanged: root.deferredPushSettings()
     onSettingsChanged: root.pushSettings()
-    onVerticalChanged: root.manageBarMotion()
-    onIsPlayingChanged: root.manageBarMotion()
     onSearchModeChanged: {
         if (root.searchMode) {
             if (root.searchSeedKey !== root.trackSeedKey()) root.seedQueryDrafts()
@@ -1385,16 +1351,53 @@ Panel {
             if (root.opened) root.focusSearchTitle()
         } else root.resetPanelCursor()
     }
-    // Host hide lifecycle: hiding the Omarchy bar releases the popout
-    // through the native close() path and stops/resets imperative bar motion
-    // so the interlude breath cannot loop while hidden; idle visibility
-    // collapse never triggers this on its own.
+    // Host hide lifecycle: hiding the bar closes the native popout.
     Connections {
         target: root.bar
         ignoreUnknownSignals: true
         function onBarHiddenChanged() {
-            root.manageBarMotion()
             if (root.bar && root.bar.barHidden === true) root.close()
+        }
+    }
+
+    Timer {
+        id: loadingRevealTimer
+        interval: 250
+        repeat: false
+        onTriggered: {
+            if (root.serviceState !== "loading") return
+            root.loadingMotionReady = true
+            if (root.loadingSnapshotText === "") {
+                root.loadingSnapshotTitle = ""
+                root.loadingSnapshotArtist = ""
+            }
+        }
+    }
+
+    Timer {
+        id: loadingLabelTimer
+        interval: 700
+        repeat: false
+        onTriggered: {
+            if (root.serviceState === "loading") root.loadingLabelReady = true
+        }
+    }
+
+    Timer {
+        id: handoffReleaseTimer
+        interval: 1
+        repeat: false
+        onTriggered: root.loadingHandoffPending = false
+    }
+
+    Timer {
+        id: loadingTraceTick
+        interval: 20
+        repeat: true
+        running: root.loadingTraceRunning
+        onTriggered: {
+            if (root.loadingTraceRunning)
+                root.loadingPhase = (root.loadingPhase + 0.014) % 1
         }
     }
 
@@ -1404,23 +1407,6 @@ Panel {
         interval: 1200
         repeat: false
         onTriggered: root.offsetFlashVisible = false
-    }
-
-    Timer {
-        id: capabilitiesFreshnessTimer
-        interval: 1000
-        repeat: true
-        running: root.showDiagnostics
-        onTriggered: root.capabilitiesClock += 1
-    }
-    // Neon rhythm pulse: low-cost tick driving the overlay phase. Running is
-    // bound so motion stops when hidden, non-ready, vertical, or paused.
-    Timer {
-        id: rhythmTick
-        interval: 150
-        repeat: true
-        running: root.motionVisible && root.rhythmPulseVisible
-        onTriggered: root.rhythmPhase = (root.rhythmPhase + 0.21) % 1.0
     }
 
     Timer {
@@ -1581,9 +1567,60 @@ Panel {
                     color: Color.muted
                     font.family: root.panelFont
                     font.pixelSize: Style.font.body
-                    visible: root.serviceState === "loading" && !root.searchMode
+                    visible: root.serviceState === "loading" && root.loadingLabelReady && !root.searchMode
                     horizontalAlignment: Text.AlignHCenter
                     text: "Loading synchronized lyrics…"
+                }
+
+                Column {
+                    width: parent.width
+                    spacing: Style.space(4)
+                    visible: root.popupLoadingSnapshotVisible
+                    opacity: loadingSnapshotItem.opacity
+                    Text {
+                        width: parent.width
+                        textFormat: Text.PlainText
+                        text: root.loadingSnapshotTitle
+                        visible: text !== ""
+                        color: root.panelForeground
+                        font.family: root.panelFont
+                        font.pixelSize: Style.font.body
+                        horizontalAlignment: Text.AlignHCenter
+                        elide: Text.ElideRight
+                    }
+                    Text {
+                        width: parent.width
+                        textFormat: Text.PlainText
+                        text: root.loadingSnapshotArtist
+                        visible: text !== ""
+                        color: Color.muted
+                        font.family: root.panelFont
+                        font.pixelSize: Style.font.caption
+                        horizontalAlignment: Text.AlignHCenter
+                        elide: Text.ElideRight
+                    }
+                    Text {
+                        width: parent.width
+                        textFormat: Text.PlainText
+                        text: root.loadingSnapshotText
+                        color: Color.muted
+                        font.family: root.panelFont
+                        font.pixelSize: Style.font.body
+                        horizontalAlignment: Text.AlignHCenter
+                        elide: Text.ElideRight
+                    }
+                }
+
+                ProgressTrace {
+                    id: popupTrace
+                    width: Math.min(parent.width, 176)
+                    x: (parent.width - width) / 2
+                    visible: root.popupTraceVisible
+                    busy: root.serviceState === "loading"
+                    busyPhase: root.motionEnabled ? root.loadingPhase : 0.5
+                    progress: root.traceProgress
+                    accentColor: Color.accent
+                    mutedColor: Color.muted
                 }
 
                 // One centered failure composition: glyph, literal message, and
@@ -1593,6 +1630,7 @@ Panel {
                     width: parent.width
                     spacing: Style.space(8)
                     visible: root.failureVisible
+                    opacity: visible ? 1 : 0
                     Text {
                         id: failureGlyph
                         width: parent.width
@@ -1671,7 +1709,7 @@ Panel {
                         Button {
                             text: "Retry capabilities"
                             anchors.horizontalCenter: parent.horizontalCenter
-                            visible: root.capabilitiesStale
+                            visible: root.capabilitiesUnavailable
                             onClicked: root.retryCapabilities()
                         }
                     }
@@ -1785,7 +1823,7 @@ Panel {
                     Button {
                         text: "Retry capabilities"
                         anchors.horizontalCenter: parent.horizontalCenter
-                        visible: root.capabilitiesStale
+                        visible: root.capabilitiesUnavailable
                         onClicked: root.retryCapabilities()
                     }
                 }
@@ -1838,21 +1876,25 @@ Panel {
                                 wrapMode: Text.Wrap
                             }
 
-                            KaraokeLine {
-                                id: currentRenderer
+                            Item {
+                                id: currentStage
                                 width: parent.width
-                                height: implicitHeight
                                 visible: rowItem.index === root.karaokeService.activeLineIndex
-                                line: rowItem.modelData
-                                position: root.karaokeService && typeof root.karaokeService.position === "number"
-                                    ? root.karaokeService.position : 0
-                                wordTiming: root.karaokeService.timing === "word"
-                                playing: root.karaokeService.activePlayer
-                                    ? root.karaokeService.activePlayer.isPlaying === true : false
-                                foreground: Color.accent
-                                muted: Color.muted
-                                fontFamily: root.panelFont
-                                fontSize: Style.font.body
+                                height: visible ? Math.max(24, currentRenderer.implicitHeight) : 0
+                                KaraokeLine {
+                                    id: currentRenderer
+                                    anchors.fill: parent
+                                    line: rowItem.modelData
+                                    position: root.karaokeService
+                                        && typeof root.karaokeService.position === "number"
+                                        ? root.karaokeService.position : 0
+                                    wordTiming: root.karaokeService.timing === "word"
+                                    playing: root.isPlaying
+                                    foreground: Color.accent
+                                    muted: Color.muted
+                                    fontFamily: root.panelFont
+                                    fontSize: Style.font.body
+                                }
                             }
 
                             Text {
@@ -1985,6 +2027,14 @@ Panel {
                         onHoveredChanged: if (hovered) root.setCursor("query", 0)
                         onAccepted: root.doSearch()
                         Keys.onEscapePressed: keyCatcher.forceActiveFocus()
+                        Keys.onTabPressed: function(event) {
+                            event.accepted = true
+                            root.focusAdjacentQueryField(1)
+                        }
+                        Keys.onBacktabPressed: function(event) {
+                            event.accepted = true
+                            root.focusAdjacentQueryField(-1)
+                        }
                     }
                     TextField {
                         id: artistField
@@ -2004,6 +2054,14 @@ Panel {
                         onHoveredChanged: if (hovered) root.setCursor("query", 1)
                         onAccepted: root.doSearch()
                         Keys.onEscapePressed: keyCatcher.forceActiveFocus()
+                        Keys.onTabPressed: function(event) {
+                            event.accepted = true
+                            root.focusAdjacentQueryField(1)
+                        }
+                        Keys.onBacktabPressed: function(event) {
+                            event.accepted = true
+                            root.focusAdjacentQueryField(-1)
+                        }
                     }
                     TextField {
                         id: albumField
@@ -2023,6 +2081,14 @@ Panel {
                         onHoveredChanged: if (hovered) root.setCursor("query", 2)
                         onAccepted: root.doSearch()
                         Keys.onEscapePressed: keyCatcher.forceActiveFocus()
+                        Keys.onTabPressed: function(event) {
+                            event.accepted = true
+                            root.focusAdjacentQueryField(1)
+                        }
+                        Keys.onBacktabPressed: function(event) {
+                            event.accepted = true
+                            root.focusAdjacentQueryField(-1)
+                        }
                     }
                     Row {
                         width: parent.width
@@ -2185,7 +2251,6 @@ Panel {
 
     Component.onCompleted: {
         root.pushSettings()
-        root.manageBarMotion()
         Qt.callLater(root.followCurrent)
     }
 }

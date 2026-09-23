@@ -58,7 +58,53 @@ function findLineIndex(lines, position, hintIndex) {
     return result
 }
 
-var INTERLUDE_GAP_S = 4.0
+var INTERLUDE_GAP_S = 1.2
+var LONG_INTERLUDE_GAP_S = 4.0
+var INTERLUDE_CONVERGE_S = 3.0
+
+function interludeThreshold() {
+    return INTERLUDE_GAP_S
+}
+
+function longInterludeThreshold() {
+    return LONG_INTERLUDE_GAP_S
+}
+
+function interludeConvergeWindow() {
+    return INTERLUDE_CONVERGE_S
+}
+
+// Below this span, a word-timed line's trailing timestamp is treated as
+// degenerate data (e.g. a zero-duration last word) rather than a genuine
+// early finish, so lineEffectiveEnd falls back to the raw line end. This
+// keeps callers that need room to work within the effective span --
+// Service.qml's seekToLine epsilon in particular -- from being handed a
+// span too thin (or zero) to use.
+var MIN_WORD_SPAN_S = 0.05
+
+function lineEffectiveEnd(line) {
+    // Kotonoha's LRC parser sets line.end to the NEXT line's start, so a
+    // word-timed line whose lyrics finish early (an explicit trailing word
+    // timestamp) would otherwise report a zero gap and never show the
+    // interlude marker. Sources with explicit line durations (YRC/KRC) are
+    // unaffected because their last word end equals line.end.
+    var end = Number(line.end)
+    var projection = projectLine(line, line.start)
+    if (!projection.hasWordTiming) return end
+    var wordEnd = Number(projection.lastWordEnd)
+    if (!finite(wordEnd)) return end
+    if (wordEnd - Number(line.start) < MIN_WORD_SPAN_S) return end
+    return Math.min(end, wordEnd)
+}
+
+function projectStateFromAnchor(lines, position, index, effectiveEnd) {
+    var pos = Number(position)
+    if (index < 0) return "before_first"
+    if (pos <= effectiveEnd) return "line"
+    if (index + 1 >= lines.length) return "after_last"
+    return Number(lines[index + 1].start) - effectiveEnd - INTERLUDE_GAP_S > 1e-9
+        ? "interlude" : "line"
+}
 
 function projectState(lines, position) {
     if (!validLines(lines) || lines.length === 0) return "unknown"
@@ -67,11 +113,8 @@ function projectState(lines, position) {
     if (pos < Number(lines[0].start)) return "before_first"
     // Nearest started line chooses the anchor; the state decides painting.
     var index = findLineIndex(lines, pos, -1)
-    if (index < 0) return "before_first"
-    if (pos <= Number(lines[index].end)) return "line"
-    if (index + 1 >= lines.length) return "after_last"
-    return Number(lines[index + 1].start) - Number(lines[index].end) > INTERLUDE_GAP_S
-        ? "interlude" : "line"
+    var effectiveEnd = index >= 0 ? lineEffectiveEnd(lines[index]) : -1
+    return projectStateFromAnchor(lines, pos, index, effectiveEnd)
 }
 
 function lineHasWordTiming(line) {
@@ -103,7 +146,8 @@ function projectLine(line, position) {
         suffixText: "",
         untimedPrefixText: "",
         timedPrefixText: "",
-        timedText: ""
+        timedText: "",
+        lastWordEnd: NaN
     }
     if (!validLine(line)) return empty
 
@@ -200,7 +244,10 @@ function projectLine(line, position) {
         suffixText: suffix,
         untimedPrefixText: untimedPrefix,
         timedPrefixText: timedPrefix,
-        timedText: timedWords.map(function(word) { return word.text }).join("")
+        timedText: timedWords.map(function(word) { return word.text }).join(""),
+        lastWordEnd: timedWords.reduce(function(max, word) {
+            return word.end > max ? word.end : max
+        }, timedWords[0].end)
     }
 }
 
@@ -213,6 +260,10 @@ function formatTime(seconds) {
 }
 if (typeof module !== "undefined" && module.exports) {
     module.exports = { findLineIndex: findLineIndex, projectLine: projectLine, formatTime: formatTime,
-        projectState: projectState, lineHasWordTiming: lineHasWordTiming, timingDetail: timingDetail,
-        validLines: validLines, interludeGapS: INTERLUDE_GAP_S }
+        projectState: projectState, projectStateFromAnchor: projectStateFromAnchor,
+        lineHasWordTiming: lineHasWordTiming, timingDetail: timingDetail,
+        validLines: validLines, interludeGapS: INTERLUDE_GAP_S, interludeThreshold: interludeThreshold,
+        longInterludeGapS: LONG_INTERLUDE_GAP_S, interludeConvergeS: INTERLUDE_CONVERGE_S,
+        lineEffectiveEnd: lineEffectiveEnd,
+        minWordSpanS: MIN_WORD_SPAN_S }
 }

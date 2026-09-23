@@ -12,13 +12,23 @@ Item {
     property var mediaService: null
     property var fallbackMediaStatus: null
     property string state: "idle"
-    property real position: 0
+    property var projectionSnapshot: ({position: 0, activeLineIndex: -1, currentLine: null, projectionState: "unknown", leadInDuration: 0, leadInProgress: 0, interludeStart: -1, interludeEnd: -1, interludeDuration: 0, interludeProgress: 0, afterLastElapsed: 0})
+    // State is primed before the immutable payload so every state-owned
+    // compatibility value signal observes the destination projection state.
+    property string projectionState: "unknown"
+    readonly property real position: root.projectionSnapshot.position
+    readonly property int activeLineIndex: root.projectionSnapshot.activeLineIndex
+    readonly property var currentLine: root.projectionSnapshot.currentLine
+    readonly property real leadInDuration: root.projectionSnapshot.leadInDuration
+    readonly property real leadInProgress: root.projectionSnapshot.leadInProgress
+    readonly property real interludeStart: root.projectionSnapshot.interludeStart
+    readonly property real interludeEnd: root.projectionSnapshot.interludeEnd
+    readonly property real interludeDuration: root.projectionSnapshot.interludeDuration
+    readonly property real interludeProgress: root.projectionSnapshot.interludeProgress
+    readonly property real afterLastElapsed: root.projectionSnapshot.afterLastElapsed
     property var document: null
     property string provider: ""
     property string timing: "none"
-    property int activeLineIndex: -1
-    property var currentLine: null
-    property string projectionState: "unknown"
     property string errorCode: ""
     property int requestGeneration: 0
     property string generationTrackKey: ""
@@ -29,6 +39,9 @@ Item {
     property int retryCooldownMs: 3000
     readonly property bool retryAvailable: !retryCooldownTimer.running
     property string networkMode: "Auto"
+    // False until the first configure(): no provider lookup may run on the
+    // Auto/all-providers defaults before the user's settings arrive.
+    property bool settingsApplied: false
     property bool neteaseEnabled: true
     property bool lrclibEnabled: true
     property bool kugouEnabled: true
@@ -58,14 +71,29 @@ Item {
     property var savedAlias: null
     property var providerAttempts: []
     property var lastDiagnostic: null
+    // Bumped by every recordDiagnostic write (fetch, search, select, forget,
+    // offset, or a landed capabilities probe). A capabilities probe snapshots
+    // this at dispatch time (actionProcess.diagnosticSerialAtDispatch); if it
+    // no longer matches when the probe finishes, a fetch or user action
+    // recorded its own diagnostic in the meantime, and the probe must not
+    // clobber it.
+    property int diagnosticSerial: 0
     property string autoRetriedKey: ""
     property bool waitingForActionExit: false
     property int actionTimeoutMs: 30000
+    // Automatic capability probes get their own, much shorter leash:
+    // cancelActionProcess deliberately exempts a running probe from the
+    // cancel-on-new-request path (see cancelActionProcess), so without this
+    // a hung probe would otherwise block search/select/forget/offset for the
+    // full actionTimeoutMs (plus the kill timer).
+    property int capabilitiesTimeoutMs: 5000
     property int searchCooldownMs: 5000
     property var searchCooldowns: ({})
     property int searchCooldownRevision: 0
 
-    readonly property var mprisPlayers: Mpris.players ? Mpris.players.values : []
+    // Writable only so the smoke harness can inject fixture players; the
+    // default binding is the live MPRIS list.
+    property var mprisPlayers: Mpris.players ? Mpris.players.values : []
     readonly property bool mprisFallbackEnabled: !root.mediaService && root.shell
         && typeof root.shell.pluginShellForBarEntry === "function"
     readonly property var activePlayer: root.mediaService ? root.mediaService.activePlayer
@@ -245,11 +273,14 @@ Item {
             root.fallbackMediaStatus = null
             root.scheduleTrackSettle()
         }
+        // Both bound paths probe once; freshness and the busy channel make
+        // repeated binds a no-op.
         if (candidate) {
             mediaRetryTimer.stop()
             root.probeCapabilities(false)
         } else if (root.mprisFallbackEnabled) {
             root.refreshFallbackMediaStatus()
+            root.probeCapabilities(false)
         } else mediaRetryTimer.restart()
     }
 
@@ -257,14 +288,22 @@ Item {
         trackSettleTimer.restart()
     }
 
+    function neutralProjectionSnapshot(positionValue) {
+        return {position: positionValue, activeLineIndex: -1, currentLine: null, projectionState: "unknown", leadInDuration: 0, leadInProgress: 0, interludeStart: -1, interludeEnd: -1, interludeDuration: 0, interludeProgress: 0, afterLastElapsed: 0}
+    }
+
+    function publishProjectionSnapshot(snapshot) {
+        root.projectionState = String(snapshot.projectionState || "unknown")
+        root.projectionSnapshot = snapshot
+    }
+
     function clearLyrics(nextState) {
+        var target = nextState || "idle"
+        root.state = target
+        root.publishProjectionSnapshot(root.neutralProjectionSnapshot(0))
         root.document = null
         root.provider = ""
         root.timing = "none"
-        root.activeLineIndex = -1
-        root.currentLine = null
-        root.projectionState = "unknown"
-        root.position = 0
         root.lastProjectionPosition = -1
         root.errorCode = ""
         root.offsetMs = 0
@@ -276,10 +315,8 @@ Item {
         root.savedAlias = null
         root.providerAttempts = []
         root.forgetError = ""
-        root.state = nextState || "idle"
         root.updateProjectionTimer()
     }
-
     function playerUrl() {
         var player = root.activePlayer
         if (!player || !player.metadata || typeof player.metadata !== "object") return null
@@ -315,6 +352,23 @@ Item {
         var lrclib = root.normalizeBool(opts.lrclibEnabled, true)
         var kugou = root.normalizeBool(opts.kugouEnabled, true)
         var showT = opts.showTranslations === "Off" ? "Off" : "On"
+        // Release a lookup held for the first configure one turn later. The
+        // host injects the widget's `bar` before its `settings` (Bar.qml
+        // injectProps): an ordinary `settings` change pushes immediately
+        // (Panel.qml onSettingsChanged -> pushSettings()), while only the
+        // push triggered by that `bar`/service change is deferred one turn
+        // (Panel.qml onKaraokeServiceChanged -> deferredPushSettings()), so
+        // it re-reads `settings` once the turn's real value has landed
+        // instead of pushing Ui/Panel.qml's placeholder default. configure()
+        // can therefore still run twice in one turn (the immediate settings
+        // push, then the deferred bar-triggered one) -- this Service-side
+        // `settingsApplied` gate stays as the backstop regardless, and
+        // configure() itself stays idempotent so a repeat call with the same
+        // values is a no-op.
+        if (!root.settingsApplied) {
+            root.settingsApplied = true
+            Qt.callLater(root.startPending)
+        }
         if (network === root.networkMode && netease === root.neteaseEnabled
                 && lrclib === root.lrclibEnabled && kugou === root.kugouEnabled
                 && showT === root.showTranslations) return
@@ -339,7 +393,9 @@ Item {
     }
 
     function cancelActionProcess() {
-        if (actionProcess.running) {
+        // Capability probes are track-independent: track settles and lookup
+        // resets let them land instead of losing the startup probe.
+        if (actionProcess.running && actionProcess.commandKind !== "capabilities") {
             actionProcess.cancelled = true
             root.waitingForActionExit = true
             actionProcess.running = false
@@ -403,7 +459,7 @@ Item {
 
     function startPending() {
         var request = root.pendingRequest
-        if (!request || root.waitingForExit || lyricProcess.running) return
+        if (!request || !root.settingsApplied || root.waitingForExit || lyricProcess.running) return
         root.pendingRequest = null
         lyricProcess.runSerial += 1
         lyricProcess.completedRun = lyricProcess.runSerial - 1
@@ -457,7 +513,11 @@ Item {
         root.requestGeneration += 1
         root.generationTrackKey = key
         root.pendingRequest = root.makeRequest(key)
+        // The new generation fences out any in-flight action, so reset the
+        // channel and search state like a track settle does.
         root.cancelFetchProcess()
+        root.cancelActionProcess()
+        root.clearSearchState()
         root.clearLyrics("loading")
         retryCooldownTimer.restart()
         if (!root.waitingForExit) root.startPending()
@@ -476,6 +536,8 @@ Item {
         if (request) request.refresh = true
         root.pendingRequest = request
         root.cancelFetchProcess()
+        root.cancelActionProcess()
+        root.clearSearchState()
         root.clearLyrics("loading")
         retryCooldownTimer.restart()
         if (!root.waitingForExit) root.startPending()
@@ -507,6 +569,8 @@ Item {
         root.generationTrackKey = capturedKey
         root.pendingRequest = root.makeRequest(capturedKey)
         root.cancelFetchProcess()
+        root.cancelActionProcess()
+        root.clearSearchState()
         root.clearLyrics("loading")
         if (!root.waitingForExit) root.startPending()
     }
@@ -521,6 +585,12 @@ Item {
     }
 
     function recordDiagnostic(kind, error, exitCode, exitStatus, elapsedMs, attempts) {
+        // An automatic capabilities probe is diagnostically stale once a
+        // fetch or user action has recorded its own diagnostic while the
+        // probe was still in flight (a probe finishing after a track
+        // change, most commonly): it must not clobber that newer entry in
+        // the diagnostics view.
+        if (kind === "capabilities" && actionProcess.diagnosticSerialAtDispatch !== root.diagnosticSerial) return
         var safeAttempts = root.validateAttempts(attempts) ? attempts : []
         root.lastDiagnostic = {
             kind: kind,
@@ -531,6 +601,7 @@ Item {
             providerAttempts: safeAttempts,
             kotonohaVersion: typeof root.kotonohaVersion === "string" ? root.kotonohaVersion.slice(0, 64) : ""
         }
+        root.diagnosticSerial += 1
     }
 
     function finalizeLyricStartFailure() {
@@ -684,7 +755,7 @@ Item {
 
     function searchAvailable(provider) {
         var revision = root.searchCooldownRevision
-        if (root.networkMode === "Offline") return false
+        if (!root.settingsApplied || root.networkMode === "Offline") return false
         if (root.providerIds().indexOf(provider) < 0) return false
         if (root.enabledProviders().split(",").indexOf(provider) < 0) return false
         var last = root.searchCooldowns[provider] || 0
@@ -757,6 +828,10 @@ Item {
         actionProcess.completed = false
         actionProcess.runRequested = true
         actionProcess.commandKind = kind
+        // Snapshot the diagnostic version at dispatch: only recordDiagnostic
+        // reads this (guarding capabilities completions), so stamping it for
+        // every kind is harmless and keeps the bookkeeping in one place.
+        actionProcess.diagnosticSerialAtDispatch = root.diagnosticSerial
         actionProcess.requestId = root.requestGeneration
         actionProcess.requestKey = root.generationTrackKey
         actionProcess.command = [root.helperPath, kind, "--request-id", String(root.requestGeneration)].concat(args)
@@ -789,8 +864,11 @@ Item {
 
     function validateAttempts(value) {
         if (value === undefined || value === null) return true
-        if (!Array.isArray(value) || value.length > 3) return false
         var providers = root.providerIds()
+        // Cap matches the helper's MAX_ATTEMPT_ITEMS (bin/karaoke-lyrics):
+        // one attempt per known provider, plus one more for an alias
+        // fall-through's own re-query attempt.
+        if (!Array.isArray(value) || value.length > providers.length + 1) return false
         var outcomes = ["candidate", "not_found", "timeout", "error", "rejected"]
         for (var i = 0; i < value.length; i++) {
             var row = value[i]
@@ -904,7 +982,7 @@ Item {
     }
 
     function selectResult(provider, songId, queryTitle, queryArtist, queryAlbum) {
-        if (root.networkMode === "Offline") return
+        if (!root.settingsApplied || root.networkMode === "Offline") return
         if (root.providerIds().indexOf(provider) < 0) return
         if (typeof songId !== "string" || songId === "") return
         if (actionProcess.running || root.waitingForActionExit) return
@@ -932,27 +1010,29 @@ Item {
         root.forgetError = ""
     }
 
+    // Returns whether the write was dispatched, like dispatchAction, so the
+    // panel only keeps its pending state for a write that is in flight.
     function writeOffset(deltaMs, setMs) {
         if (!root.offsetKey) {
             root.offsetError = "offset_unavailable"
-            return
+            return false
         }
-        if (actionProcess.running || root.waitingForActionExit) return
+        if (actionProcess.running || root.waitingForActionExit) return false
         var args = ["--key-json", JSON.stringify(root.offsetKey)]
         if (setMs !== undefined && setMs !== null) args.push("--set-ms", String(setMs))
         else args.push("--delta-ms", String(deltaMs))
         root.offsetError = ""
         root.offsetRetry = {deltaMs: deltaMs, setMs: (setMs !== undefined && setMs !== null) ? setMs : null}
-        root.dispatchAction("offset", args)
+        return root.dispatchAction("offset", args)
     }
 
     function nudgeOffset(deltaMs) {
-        if (typeof deltaMs !== "number" || !root.finite(deltaMs)) return
-        root.writeOffset(Math.trunc(deltaMs), null)
+        if (typeof deltaMs !== "number" || !root.finite(deltaMs)) return false
+        return root.writeOffset(Math.trunc(deltaMs), null)
     }
 
     function resetOffset() {
-        root.writeOffset(null, 0)
+        return root.writeOffset(null, 0)
     }
 
     function retryOffset() {
@@ -971,8 +1051,34 @@ Item {
         if (!line || !root.finite(Number(line.start)) || Number(line.start) < 0) return false
         var player = root.activePlayer
         if (!player || player.canSeek !== true || player.positionSupported !== true) return false
+        // Line timestamps are display-space: performProjection derives
+        // displayPosition = rawPosition + offsetMs / 1000. Undo the offset
+        // here so the raw player clock, once the offset is reapplied by the
+        // next projection, lands back on this exact line instead of
+        // drifting by offsetMs (a negative offset would otherwise land on
+        // the previous line). A fixed 10ms epsilon keeps the floating-point
+        // round trip (subtract then re-add the offset) from landing
+        // fractionally before the line's start; it is clamped against the
+        // line's effective end (KaraokeModel.lineEffectiveEnd -- the same
+        // min(line.end, last word end) projectState itself uses), so a
+        // word-timed line whose lyrics finish well before line.end can't
+        // have its epsilon land the reprojected position past the effective
+        // end and into the following interlude. KaraokeModel ignores word
+        // ends under its 50ms MIN_WORD_SPAN_S floor, so the effective span
+        // is always either the raw line end or at least 50ms wide -- room
+        // enough for the fixed 10ms epsilon to always fit. The final raw
+        // position is clamped at zero.
+        var offsetS = root.offsetMs / 1000
+        var start = Number(line.start)
+        var rawStart = start - offsetS
+        var effectiveEnd = KaraokeModel.lineEffectiveEnd(line)
+        var rawEnd = root.finite(effectiveEnd) ? effectiveEnd - offsetS : rawStart
+        var seekEpsilonS = 0.01
+        var rawTarget = rawStart + seekEpsilonS
+        if (rawTarget > rawEnd) rawTarget = rawEnd
+        if (rawTarget < 0) rawTarget = 0
         try {
-            player.position = Number(line.start)
+            player.position = rawTarget
         } catch (error) {
             return false
         }
@@ -1233,8 +1339,25 @@ Item {
             root.capabilities = null
             root.kotonohaVersion = ""
             root.capabilitiesError = "capabilities_unavailable"
+            // Whether this probe's own timeout write is about to land, or
+            // recordDiagnostic's capabilities guard is about to block it
+            // because a different diagnostic already superseded this probe.
+            var timeoutWriteLands = actionProcess.diagnosticSerialAtDispatch === root.diagnosticSerial
             root.recordDiagnostic("capabilities", "capabilities_unavailable", -1, "",
                 root.elapsedFor(actionProcess), [])
+            if (timeoutWriteLands) {
+                // Re-snapshot: this write just bumped diagnosticSerial, so
+                // without this the same guard would see the (now stale)
+                // dispatch-time snapshot and refuse the later "refresh with
+                // observed exit" write in completeAction() when the killed
+                // process actually exits, leaving exitCode stuck at -1
+                // forever. Only do this when the write above actually
+                // landed -- if it was blocked instead (a different
+                // diagnostic already superseded this probe), leave the
+                // stale snapshot alone so the eventual exit's refresh stays
+                // blocked too, instead of clobbering that newer entry.
+                actionProcess.diagnosticSerialAtDispatch = root.diagnosticSerial
+            }
             return
         }
         if (expiredId === root.requestGeneration && expiredKey === root.generationTrackKey
@@ -1344,8 +1467,12 @@ Item {
         if (!key || typeof key !== "object") return false
         if (typeof key.trackTitle !== "string" || typeof key.trackArtist !== "string"
                 || typeof key.trackAlbum !== "string") return false
-        if (key.trackDurationS !== undefined && key.trackDurationS !== null
-                && (!root.finite(Number(key.trackDurationS)))) return false
+        // Helper TrackOffsetKey contract: the field is present and is null or
+        // a non-negative integer (no strings, booleans, or arrays).
+        var duration = key.trackDurationS
+        if (duration === undefined) return false
+        if (duration !== null && (!root.finite(duration) || Math.floor(duration) !== duration
+                || duration < 0)) return false
         if (typeof key.lyricsSourceId !== "string" || typeof key.lyricsDigest !== "string") return false
         if (key.lyricsSongId !== undefined && key.lyricsSongId !== null
                 && typeof key.lyricsSongId !== "string") return false
@@ -1505,43 +1632,53 @@ Item {
 
     function performProjection(force) {
         if (root.state !== "ready" || !Array.isArray(root.lines) || root.lines.length === 0 || !root.activePlayer) {
-            root.activeLineIndex = -1
-            root.currentLine = null
-            root.projectionState = "unknown"
+            root.publishProjectionSnapshot(root.neutralProjectionSnapshot(root.position))
             return
         }
         var nextPosition = Number(root.activePlayer.position)
         if (!root.finite(nextPosition) || nextPosition < 0) {
-            root.position = -1
+            root.publishProjectionSnapshot(root.neutralProjectionSnapshot(-1))
             root.lastProjectionPosition = -1
-            root.activeLineIndex = -1
-            root.currentLine = null
-            root.projectionState = "unknown"
             return
         }
         var displayPosition = nextPosition + root.offsetMs / 1000
-        var state = KaraokeModel.projectState(root.lines, displayPosition)
-        root.projectionState = state
+        var hint = root.activeLineIndex
+        if (force || root.lastProjectionPosition < 0 || displayPosition < root.lastProjectionPosition
+                || Math.abs(displayPosition - root.lastProjectionPosition) > 2) hint = -1
+        var index = KaraokeModel.findLineIndex(root.lines, displayPosition, hint)
+        var effectiveEnd = index >= 0 ? Number(KaraokeModel.lineEffectiveEnd(root.lines[index])) : -1
+        var state = KaraokeModel.projectStateFromAnchor(root.lines, displayPosition, index, effectiveEnd)
+
+        var activeIndex = -1
+        var current = null
+        var leadInDuration = 0
+        var leadInProgress = 0
+        var interludeStart = -1
+        var interludeEnd = -1
+        var interludeDuration = 0
+        var interludeProgress = 0
+        var afterLastElapsed = 0
+
         if (state === "line") {
-            var hint = root.activeLineIndex
-            if (force || root.lastProjectionPosition < 0 || displayPosition < root.lastProjectionPosition
-                    || Math.abs(displayPosition - root.lastProjectionPosition) > 2) hint = -1
-            var index = KaraokeModel.findLineIndex(root.lines, displayPosition, hint)
-            root.position = displayPosition
-            root.lastProjectionPosition = displayPosition
-            root.activeLineIndex = index
-            root.currentLine = index >= 0 ? root.lines[index] : null
+            activeIndex = index
+            current = index >= 0 ? root.lines[index] : null
         } else if (state === "before_first") {
-            root.position = displayPosition
-            root.lastProjectionPosition = displayPosition
-            root.activeLineIndex = -1
-            root.currentLine = root.lines[0]
-        } else {
-            root.position = displayPosition
-            root.lastProjectionPosition = displayPosition
-            root.activeLineIndex = -1
-            root.currentLine = null
+            var firstStart = Math.max(0, Number(root.lines[0].start))
+            leadInDuration = firstStart
+            leadInProgress = firstStart > 0
+                ? Math.max(0, Math.min(1, displayPosition / firstStart)) : 1
+        } else if (state === "interlude" && index >= 0 && index + 1 < root.lines.length) {
+            interludeStart = effectiveEnd
+            interludeEnd = Number(root.lines[index + 1].start)
+            interludeDuration = Math.max(0, interludeEnd - interludeStart)
+            interludeProgress = interludeDuration > 0
+                ? Math.max(0, Math.min(1, (displayPosition - interludeStart) / interludeDuration)) : 1
+        } else if (state === "after_last") {
+            afterLastElapsed = Math.max(0, displayPosition - effectiveEnd)
         }
+
+        root.lastProjectionPosition = displayPosition
+        root.publishProjectionSnapshot({position: displayPosition, activeLineIndex: activeIndex, currentLine: current, projectionState: state, leadInDuration: leadInDuration, leadInProgress: leadInProgress, interludeStart: interludeStart, interludeEnd: interludeEnd, interludeDuration: interludeDuration, interludeProgress: interludeProgress, afterLastElapsed: afterLastElapsed})
     }
 
     function updateProjectionTimer() {
@@ -1606,7 +1743,11 @@ Item {
 
     Timer {
         id: actionWatchdog
-        interval: root.actionTimeoutMs
+        // A capabilities probe gets its own, much shorter leash: it is
+        // exempt from cancelActionProcess (see cancelActionProcess), so it
+        // must not be able to block search/select/forget/offset for the
+        // full actionTimeoutMs if it hangs.
+        interval: actionProcess.commandKind === "capabilities" ? root.capabilitiesTimeoutMs : root.actionTimeoutMs
         repeat: false
         onTriggered: root.handleActionTimeout()
     }
@@ -1745,6 +1886,9 @@ Item {
     Process {
         id: actionProcess
         property string commandKind: ""
+        // Snapshot of root.diagnosticSerial taken at dispatch; see
+        // recordDiagnostic's capabilities guard.
+        property int diagnosticSerialAtDispatch: -1
         property int requestId: 0
         property string requestKey: ""
         property int actionSerial: 0

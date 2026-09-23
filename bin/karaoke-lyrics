@@ -102,7 +102,10 @@ MAX_WARNING_ITEMS = 8
 MAX_WARNING_CHARS = 64
 MAX_VERSION_CHARS = 64
 MAX_FIELD_CHARS = 256
-MAX_ATTEMPT_ITEMS = 3
+# One attempt per known provider (len(PROVIDER_ORDER)), plus one more: an
+# alias fall-through can attempt the alias's own provider a second time (the
+# re-query, then again in the ordinary pass) alongside the other providers.
+MAX_ATTEMPT_ITEMS = len(PROVIDER_ORDER) + 1
 ALIAS_MAX_ROWS = 1000
 ALIAS_SCHEMA_VERSION = 1
 ALIAS_DIR_MODE = 0o700
@@ -998,6 +1001,12 @@ async def fetch_lyrics(track: Any, request_id: int, *, storage: Any = None,
                        refresh: bool = False, url: Any = None, reported_title: Any = None,
                        offset_store: Any = None,
                        alias_db_path: Path | None = None) -> dict[str, Any]:
+    # A single overall deadline for this fetch, computed once here: the
+    # alias re-query pass (when a saved alias's manual cache entry is gone)
+    # and the ordinary provider pass each draw from what remains of it, so
+    # the two passes together cannot exceed `deadline` regardless of how the
+    # network time between them is split.
+    deadline_at = time.monotonic() + max(deadline, 0.0)
     if IMPORT_ERROR is not None and provider_specs is None:
         return _error_response(request_id, track, "dependency_error", "kotonoha_unavailable")
     specs = provider_specs if provider_specs is not None else _providers()
@@ -1031,6 +1040,11 @@ async def fetch_lyrics(track: Any, request_id: int, *, storage: Any = None,
     alias, alias_warnings = _alias_load(track, alias_db_path)
     warnings = _merge_warnings(warnings, alias_warnings)
     saved_alias = alias
+    # Attempts from the alias re-query, kept only when that query actually
+    # falls through to ordinary resolution below: the alias provider was
+    # genuinely contacted and must be reported alongside the ordinary
+    # pass's attempts, not dropped.
+    alias_fallthrough_attempts: list[dict[str, Any]] = []
     if alias is not None:
         alias_provider = alias["provider"]
         alias_song = alias["songId"]
@@ -1084,7 +1098,7 @@ async def fetch_lyrics(track: Any, request_id: int, *, storage: Any = None,
 
             winners, _completed, _clean, _usable, alias_attempts = await _fetch_network(
                 query_track, alias_specs, session_factory or new_lyrics_session,
-                deadline, alias_consider)
+                max(deadline_at - time.monotonic(), 0.0), alias_consider)
             if winners:
                 artifact = winners[0][0]
                 try:
@@ -1095,8 +1109,9 @@ async def fetch_lyrics(track: Any, request_id: int, *, storage: Any = None,
                         except Exception:
                             # The rebuilt correction cannot be persisted, so it
                             # must not be reported as a durable cache/manual
-                            # hit: the next offline process would answer
-                            # alias_unavailable for the same alias.
+                            # hit: an offline retry with no manual entry would
+                            # otherwise silently fall through to ordinary
+                            # resolution instead of reusing this correction.
                             return _error_response(
                                 request_id, track, "provider_error", "cache_store_failed",
                                 warnings=warnings, provider_attempts=alias_attempts,
@@ -1129,12 +1144,25 @@ async def fetch_lyrics(track: Any, request_id: int, *, storage: Any = None,
                 return _error_response(request_id, track, "provider_error", "invalid_payload",
                                        warnings=warnings, provider_attempts=alias_attempts,
                                        saved_alias=saved_alias)
-            return _error_response(request_id, track, "not_found", "alias_unavailable",
-                                   warnings=warnings, provider_attempts=alias_attempts,
-                                   saved_alias=saved_alias)
+            # The alias provider returned a clean not-found for the saved
+            # song id (not malformed data): the manual cache entry backing
+            # this alias is gone, most likely LRU-evicted from the shared
+            # 1000-entry cache. Fall through to ordinary resolution
+            # (automatic cache, then enabled providers) on the track's
+            # ordinary metadata, exactly as if no alias existed. The alias
+            # row itself is left in place rather than deleted. The alias
+            # provider was genuinely contacted, so its attempt is carried
+            # into the ordinary pass's reported providerAttempts below
+            # instead of being dropped.
+            alias_fallthrough_attempts = alias_attempts
         else:
-            return _error_response(request_id, track, "not_found", "alias_unavailable",
-                                   warnings=warnings, saved_alias=saved_alias)
+            # The alias provider cannot be re-queried here (network is off,
+            # the provider is disabled, or the provider id is unknown) and
+            # the manual cache entry is gone. Fall through to ordinary
+            # resolution instead of a dead-end alias_unavailable error; the
+            # alias row is left in place for when the provider is queryable
+            # again.
+            pass
 
     candidates: list[tuple[Any, str]] = []
     if storage is not None:
@@ -1165,7 +1193,9 @@ async def fetch_lyrics(track: Any, request_id: int, *, storage: Any = None,
         return response
 
     winners, completed, clean, usable, attempts = await _fetch_network(
-        track, specs, session_factory or new_lyrics_session, deadline, consider)
+        track, specs, session_factory or new_lyrics_session,
+        max(deadline_at - time.monotonic(), 0.0), consider)
+    attempts = alias_fallthrough_attempts + attempts
     if winners:
         docs_by_artifact = {id(artifact): doc for artifact, doc in winners}
         for candidate in _ranked([artifact for artifact, _doc in winners], track):

@@ -16,7 +16,26 @@ N501 Verse is an Omarchy bar plugin that keeps the current lyric line beside the
 
 ## Install
 
-The recommended path is the idempotent one-command bootstrap. Review `install.sh` before running it:
+`omarchy plugin add` installs the plugin files. It does **not** run `install.sh` or install Kotonoha. If Kotonoha is not already importable by `/usr/bin/python3`, install it first:
+
+```bash
+omarchy pkg aur add kotonoha-git
+/usr/bin/python3 -c 'import kotonoha'
+```
+
+Then add and place the widget:
+
+```bash
+omarchy plugin add https://github.com/Nombah501/n501-verse.git --enable --yes
+omarchy bar put n501.karaoke --after tablet-mode
+omarchy bar move n501.karaoke --section left --after tablet-mode
+```
+
+The plugin keeps the technical ID `n501.karaoke` for stable configuration while presenting the product as **N501 Verse**.
+
+### Optional bootstrap
+
+If you prefer a single setup command, review `install.sh` and run it explicitly:
 
 ```bash
 (
@@ -36,17 +55,7 @@ The bootstrap:
 4. adds or updates the git-managed plugin;
 5. places it after `tablet-mode`.
 
-It uses official Omarchy commands and never runs `pip`, `curl | bash`, or a plugin install hook. The AUR package manager may build third-party code on your system; inspect the package and script if that matters for your threat model.
-
-For a manual install, prepare Kotonoha first and then run:
-
-```bash
-omarchy plugin add https://github.com/Nombah501/n501-verse.git --enable --yes
-omarchy bar put n501.karaoke --after tablet-mode
-omarchy bar move n501.karaoke --section left --after tablet-mode
-```
-
-The plugin keeps the technical ID `n501.karaoke` for stable configuration while presenting the product as **N501 Verse**.
+It uses Omarchy commands and runs only when you invoke it. The AUR package manager may build third-party code on your system; inspect the package and script before use.
 
 ### Update or remove
 
@@ -61,10 +70,10 @@ The plugin runs inside `omarchy-shell` as unsandboxed QML/Python code. Review th
 
 - Omarchy with third-party plugin support.
 - An active media player exposed through Omarchy's selected media service.
-- An AUR helper available to `omarchy pkg aur add` for the bootstrap path.
+- An AUR helper available to `omarchy pkg aur add` if Kotonoha needs installation.
 - Kotonoha importable by `/usr/bin/python3` after installation.
 
-No separate `playerctl` reader, player-specific integration, credentials, or plugin-owned lyrics database is required.
+No separate `playerctl` reader, player-specific integration, or credentials are required. Search corrections use a small plugin-owned SQLite database described below.
 
 ## Timing you can trust
 
@@ -103,6 +112,7 @@ A provider advertising “synchronized lyrics” does not guarantee word timing.
 - **LRCLIB** — free community source; ordinary results are line-timed.
 - **Kugou** — experimental community source; word timing depends on availability.
 - **Translations** — show or hide translated lines when supplied.
+- **Motion** — animate the loading trace. Timestamp progress and synchronized word fill remain visible when motion is off.
 
 Provider availability, timing, rights, and correctness are not guaranteed. Network and cache documents are for personal display; lyric rights remain with their respective owners.
 
@@ -110,7 +120,8 @@ Provider availability, timing, rights, and correctness are not guaranteed. Netwo
 
 - Network lookups happen only in **Auto** mode.
 - Local sidecars and embedded lyrics are read from the active local track; they are not sent to a network provider by the local-first path.
-- The plugin reuses Kotonoha's shared cache rather than creating a second lyric database.
+- The shared lyric cache and timing offsets use Kotonoha's storage. The plugin does not create a second lyrics cache.
+- Search corrections are stored in `$XDG_STATE_HOME/n501.karaoke/search_aliases.sqlite3` (or `~/.local/state/n501.karaoke/search_aliases.sqlite3` when `XDG_STATE_HOME` is unset). This SQLite file holds original track metadata, the selected query, and the matched result identity; it stores no lyric bodies.
 - Diagnostics use bounded machine-readable errors and do not include lyric bodies, provider payloads, cookies, or headers.
 
 ## Troubleshooting
