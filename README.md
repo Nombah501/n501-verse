@@ -4,6 +4,10 @@
 
 N501 Verse is an Omarchy bar plugin that keeps the current lyric line beside the music you are playing. It resolves lyrics locally first, works with the shared Kotonoha cache, and exposes a native panel for search, correction, and timing calibration.
 
+![N501 Verse panel showing synchronized demo lyrics](preview.png)
+
+Preview captured from the QML panel with synthetic demo metadata and lyrics.
+
 ## Why N501 Verse
 
 - **Native to Omarchy** — a real bar widget and panel, not a separate overlay competing with the shell.
