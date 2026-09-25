@@ -64,6 +64,11 @@ Item {
     // Bounded failure token for the last forget/remove action. Failed removal
     // never discards the working document; the ready panel renders this.
     property string forgetError: ""
+    // Two-step "Clear cache": "" → counting → confirm → clearing → done | error.
+    // Global (track-independent) like capabilities; only automatic entries go.
+    property string cacheClearState: ""
+    property int cacheClearEntries: 0
+    property int cacheClearRemoved: 0
     property var searchQuery: null
     property string selectedProvider: ""
     property string selectedSongId: ""
@@ -393,9 +398,10 @@ Item {
     }
 
     function cancelActionProcess() {
-        // Capability probes are track-independent: track settles and lookup
-        // resets let them land instead of losing the startup probe.
-        if (actionProcess.running && actionProcess.commandKind !== "capabilities") {
+        // Capability probes and cache clearing are track-independent: track
+        // settles and lookup resets let them land instead of losing them.
+        if (actionProcess.running && actionProcess.commandKind !== "capabilities"
+                && actionProcess.commandKind !== "clear-cache") {
             actionProcess.cancelled = true
             root.waitingForActionExit = true
             actionProcess.running = false
@@ -646,6 +652,12 @@ Item {
         actionProcess.timedOutAction = -1
         root.waitingForActionExit = false
         actionWatchdog.stop()
+        if (kind === "clear-cache") {
+            root.recordDiagnostic(kind, "helper_unavailable", -1, "",
+                root.elapsedFor(actionProcess), [])
+            root.cacheClearState = wasCancelled ? "" : "error"
+            return
+        }
         if (wasCancelled) return
         // Capability probes are track-independent: a failed probe stays
         // retryable (freshness cleared, error set) even when the track
@@ -1007,6 +1019,30 @@ Item {
             ["--provider", provider, "--song-id", songId].concat(trackArgs))
     }
 
+    function requestCacheClear() {
+        root.cacheClearEntries = 0
+        root.cacheClearRemoved = 0
+        if (root.dispatchAction("clear-cache", ["--count-only"])) root.cacheClearState = "counting"
+    }
+
+    function confirmCacheClear() {
+        if (root.cacheClearState !== "confirm") return
+        if (root.dispatchAction("clear-cache", [])) root.cacheClearState = "clearing"
+    }
+
+    function dismissCacheClear() {
+        if (root.cacheClearState === "counting" || root.cacheClearState === "clearing") return
+        root.cacheClearState = ""
+    }
+
+    function validateCacheClear(payload, expectedId) {
+        if (!payload || typeof payload !== "object") return false
+        if (payload.schemaVersion !== 1 || payload.requestId !== expectedId) return false
+        if (payload.status !== "ready") return false
+        return Number.isInteger(payload.automaticEntries) && payload.automaticEntries >= 0
+            && Number.isInteger(payload.removed) && payload.removed >= 0
+    }
+
     function clearForgetError() {
         root.forgetError = ""
     }
@@ -1157,6 +1193,7 @@ Item {
                 root.recordDiagnostic(kind || "action", keepError, exitCode, exitStatus,
                     root.elapsedFor(actionProcess), keepAttempts)
             }
+            if (kind === "clear-cache") root.cacheClearState = wasTimeout ? "error" : ""
             if (kind === "capabilities") {
                 root.capabilitiesProbedAtMs = 0
                 if (wasTimeout) {
@@ -1169,8 +1206,8 @@ Item {
             }
             return
         }
-        // Capability results are track-independent: a late probe must still land.
-        if (kind !== "capabilities"
+        // Capability and cache-clear results are track-independent: a late one must still land.
+        if (kind !== "capabilities" && kind !== "clear-cache"
                 && (requestId !== root.requestGeneration || requestKey !== root.generationTrackKey
                     || requestKey !== root.trackKey)) return
         var parsed = null
@@ -1179,6 +1216,24 @@ Item {
             parsed = JSON.parse(text)
         } catch (error) {
             parsed = null
+        }
+        if (kind === "clear-cache") {
+            if (parsed === null || !root.validateCacheClear(parsed, requestId)) {
+                root.cacheClearState = "error"
+                root.recordDiagnostic(kind, parsed !== null && root.validateErrorToken(parsed.error)
+                    && parsed.error !== "" ? parsed.error : "invalid_response", exitCode, exitStatus,
+                    root.elapsedFor(actionProcess), [])
+                return
+            }
+            root.recordDiagnostic(kind, "", exitCode, exitStatus, root.elapsedFor(actionProcess), [])
+            if (root.cacheClearState === "counting") {
+                root.cacheClearEntries = parsed.automaticEntries
+                root.cacheClearState = "confirm"
+            } else {
+                root.cacheClearRemoved = parsed.removed
+                root.cacheClearState = "done"
+            }
+            return
         }
         var nonzero = (typeof exitCode === "number" && exitCode !== 0) || exitStatus === "crash"
         if (kind === "capabilities") {
@@ -1359,6 +1414,12 @@ Item {
                 // blocked too, instead of clobbering that newer entry.
                 actionProcess.diagnosticSerialAtDispatch = root.diagnosticSerial
             }
+            return
+        }
+        if (expiredKind === "clear-cache") {
+            root.cacheClearState = "error"
+            root.recordDiagnostic("clear-cache", "resolver_timeout", -1, "",
+                root.elapsedFor(actionProcess), [])
             return
         }
         if (expiredId === root.requestGeneration && expiredKey === root.generationTrackKey

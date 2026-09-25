@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "n501.karaoke",
   "name": "N501 Verse",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "author": "n501",
   "description": "Synchronized lyrics that stay with your music.",
   "license": "MIT",

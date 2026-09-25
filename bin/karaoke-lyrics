@@ -1522,6 +1522,36 @@ def forget_entry(request_id: int, provider: str, song_id: str, *,
     return response
 
 
+def _clear_cache_response(request_id: int, status: str, entries: int, removed: int,
+                          error: str) -> dict[str, Any]:
+    return {
+        "schemaVersion": SCHEMA_VERSION,
+        "requestId": request_id,
+        "status": status,
+        "automaticEntries": entries,
+        "removed": removed,
+        "error": error,
+    }
+
+
+def clear_cache(request_id: int, *, count_only: bool, storage: Any = None) -> dict[str, Any]:
+    """Count or delete automatic Lyrics Cache entries; manual entries,
+    saved corrections and Timing Offsets are never touched."""
+    if IMPORT_ERROR is not None and storage is None:
+        return _clear_cache_response(request_id, "provider_error", 0, 0, "helper_unavailable")
+    if storage is None:
+        ensure_cache_store(cache_path())
+        storage = LyricsCacheStorage(cache_path(), max_entries=1000)
+    try:
+        if count_only:
+            entries = storage.count(LyricsCacheMode.AUTO)
+            return _clear_cache_response(request_id, "ready", entries, 0, "")
+        removed = storage.clear_automatic()
+    except Exception:
+        return _clear_cache_response(request_id, "provider_error", 0, 0, "cache_delete_failed")
+    return _clear_cache_response(request_id, "ready", 0, removed, "")
+
+
 _OFFSET_MISSING = object()
 
 
@@ -1903,6 +1933,9 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     forget.add_argument("--artist", required=True)
     forget.add_argument("--album", default="")
     forget.add_argument("--duration", type=float)
+    clear = subparsers.add_parser("clear-cache")
+    clear.add_argument("--request-id", type=int, required=True)
+    clear.add_argument("--count-only", action="store_true")
     offset = subparsers.add_parser("offset")
     offset.add_argument("--request-id", type=int, required=True)
     offset.add_argument("--key-json", required=True)
@@ -2041,6 +2074,13 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         response = forget_entry(request_id, args.provider, args.song_id, track=track)
         print(_bounded_forget_json(response))
+        return 0
+    if args.action == "clear-cache":
+        if args.request_id < 0:
+            response = _clear_cache_response(request_id, "provider_error", 0, 0, "invalid_request")
+        else:
+            response = clear_cache(args.request_id, count_only=args.count_only)
+        print(json.dumps(response, separators=(",", ":")))
         return 0
     if args.action == "offset":
         try:

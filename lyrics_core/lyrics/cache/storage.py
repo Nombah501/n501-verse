@@ -240,15 +240,20 @@ class LyricsCacheStorage:
                 results.append(CacheDeleteResult(key, status))
         return tuple(results)
 
-    def clear(self) -> None:
-        """Delete every persisted lyric cache entry."""
+    def clear_automatic(self) -> int:
+        """Delete automatic entries only; manual (user-selected) entries stay. Returns rows removed."""
         with self._connect() as connection:
-            connection.execute("DELETE FROM lyrics")
+            cursor = connection.execute("DELETE FROM lyrics WHERE mode = ?", (LyricsCacheMode.AUTO.value,))
+        return cursor.rowcount
 
-    def count(self) -> int:
-        """Return the number of persisted lyric cache entries."""
+    def count(self, mode: LyricsCacheMode | None = None) -> int:
+        """Return the number of persisted entries, optionally of one mode."""
         with self._connect() as connection:
-            row = connection.execute("SELECT COUNT(*) AS count FROM lyrics").fetchone()
+            if mode is None:
+                row = connection.execute("SELECT COUNT(*) AS count FROM lyrics").fetchone()
+            else:
+                row = connection.execute(
+                    "SELECT COUNT(*) AS count FROM lyrics WHERE mode = ?", (mode.value,)).fetchone()
         return int(row["count"]) if row is not None else 0
 
     def _connect(self) -> sqlite3.Connection:

@@ -106,8 +106,15 @@ Provider availability, timing, rights, and correctness are not guaranteed. Netwo
 
 - Network lookups happen only in **Auto** mode. LRCLIB requests identify the plugin in their `User-Agent`.
 - Local sidecars and embedded lyrics are read from the active local track; they are not sent to a network provider by the local-first path.
-- The lyrics cache lives in `$XDG_CACHE_HOME/n501.karaoke/lyrics.sqlite3` and timing offsets in `$XDG_STATE_HOME/n501.karaoke/track_offsets.sqlite3` (`~/.cache` and `~/.local/state` when the variables are unset). Directories are created `0700` and files `0600`.
-- Search corrections are stored in `$XDG_STATE_HOME/n501.karaoke/search_aliases.sqlite3`. This SQLite file holds original track metadata, the selected query, and the matched result identity; it stores no lyric bodies.
+- Everything the plugin writes is in three SQLite files (`~/.cache` and `~/.local/state` when `$XDG_CACHE_HOME`/`$XDG_STATE_HOME` are unset). Directories are created `0700` and files `0600`. Each file has a fixed row limit, so none of them grows without bound:
+
+  | File | Holds | Limit |
+  | --- | --- | --- |
+  | `$XDG_CACHE_HOME/n501.karaoke/lyrics.sqlite3` | Lyrics found automatically and lyrics you picked by hand | 1,000 entries (about 7 KB each); the least recently used go first |
+  | `$XDG_STATE_HOME/n501.karaoke/track_offsets.sqlite3` | Timing offsets | 5,000 entries; the least recently changed go first |
+  | `$XDG_STATE_HOME/n501.karaoke/search_aliases.sqlite3` | Search corrections: original track metadata, the query, and the matched result identity; no lyric text | 1,000 entries; the least recently saved go first |
+
+- **Details → Clear cache** removes only automatically found lyrics; they are fetched again on the next play. Lyrics you picked by hand, search corrections, and timing offsets stay. To remove everything, delete the three files above.
 - Diagnostics use bounded machine-readable errors and do not include lyric bodies, provider payloads, cookies, or headers.
 
 ### Coming from Kotonoha or N501 Verse 0.3

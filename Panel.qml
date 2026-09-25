@@ -257,6 +257,25 @@ Panel {
     }
     readonly property string forgetLabel: "Forget saved correction"
     readonly property string removeLabel: "Remove cached match"
+    // Two clicks: count automatic entries first, then confirm with the number.
+    readonly property string clearCacheLabel: {
+        var svc = root.karaokeService
+        switch (svc ? svc.cacheClearState : "") {
+        case "counting": return "Clear cache…"
+        case "confirm":
+            return svc.cacheClearEntries === 0 ? "Cache is empty"
+                : "Confirm (" + svc.cacheClearEntries + (svc.cacheClearEntries === 1 ? " entry)" : " entries)")
+        case "clearing": return "Clearing…"
+        case "done": return "Cleared " + svc.cacheClearRemoved + (svc.cacheClearRemoved === 1 ? " entry" : " entries")
+        case "error": return "Clear cache failed · retry"
+        default: return "Clear cache"
+        }
+    }
+    onShowDiagnosticsChanged: {
+        if (!root.showDiagnostics && root.karaokeService
+                && typeof root.karaokeService.dismissCacheClear === "function")
+            root.karaokeService.dismissCacheClear()
+    }
     // Failed forget/remove while ready: bounded token, actionable copy, and
     // visibility for the ready failure banner. The document is preserved.
     readonly property string forgetFailureMessage: {
@@ -739,6 +758,7 @@ Panel {
         if (root.offsetControlsAvailable) ids.push("earlier", "later", "reset")
         if (!root.followEnabled) ids.push("follow")
         ids.push("details")
+        if (root.showDiagnostics) ids.push("clearCache")
         ids.push("layoutMode")
         if (root.karaokeService && root.karaokeService.offsetError !== "") ids.push("retry_offset")
         if (root.forgetVisible) ids.push("forget")
@@ -763,6 +783,7 @@ Panel {
         case "remove": return root.removeLabel
         case "primary": return root.failureActionText
         case "retry_offset": return "Retry offset"
+        case "clearCache": return root.clearCacheLabel
         default: return action
         }
     }
@@ -789,6 +810,11 @@ Panel {
         if (action === "earlier" || action === "later" || action === "reset")
             return root.offsetControlsAvailable && !root.offsetWritePending
         if (action === "retry_offset") return true
+        if (action === "clearCache") {
+            var clearState = svc ? svc.cacheClearState : ""
+            if (clearState === "counting" || clearState === "clearing" || clearState === "done") return false
+            return !(clearState === "confirm" && svc.cacheClearEntries === 0)
+        }
         if (action === "layoutMode") return true
         if (action === "forget" || action === "remove")
             return !!svc && !!svc.selectedProvider && !!svc.selectedSongId
@@ -823,6 +849,11 @@ Panel {
             return
         case "details":
             root.showDiagnostics = !root.showDiagnostics
+            return
+        case "clearCache":
+            if (!svc) return
+            if (svc.cacheClearState === "confirm") svc.confirmCacheClear()
+            else svc.requestCacheClear()
             return
         case "layoutMode":
             root.cycleLayoutMode()

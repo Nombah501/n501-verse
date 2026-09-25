@@ -11,6 +11,8 @@ from ..display.offsets import TrackOffsetEntry, TrackOffsetKey, TrackOffsetSnaps
 
 TRACK_OFFSET_DATABASE_NAME = "track_offsets.sqlite3"
 TRACK_OFFSET_SCHEMA_VERSION = 2
+# Upper bound on stored corrections; the least recently updated rows go first.
+TRACK_OFFSET_MAX_ENTRIES = 5000
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS track_offsets (
@@ -54,9 +56,12 @@ class TrackOffsetStoreError(RuntimeError):
 class TrackOffsetStore:
     """Own SQLite schema and row conversion for track timing corrections."""
 
-    def __init__(self, path: Path | None = None) -> None:
+    def __init__(self, path: Path | None = None, max_entries: int = TRACK_OFFSET_MAX_ENTRIES) -> None:
         """Create a storage owner without opening a database connection."""
+        if max_entries < 1:
+            raise ValueError("track offset store needs room for at least one entry")
         self._path = path
+        self._max_entries = max_entries
 
     def load(self) -> TrackOffsetSnapshot:
         """Load all valid corrections, creating the schema when needed."""
@@ -113,6 +118,14 @@ class TrackOffsetStore:
                     "lyrics_source_id, lyrics_song_id, lyrics_digest) DO UPDATE SET "
                     "offset_ms = excluded.offset_ms, updated_at = excluded.updated_at",
                     _row_values(entry, time()),
+                )
+                connection.execute(
+                    "DELETE FROM track_offsets WHERE (track_title, track_artist, track_album, "
+                    "track_duration_s, lyrics_source_id, lyrics_song_id, lyrics_digest) IN ("
+                    "SELECT track_title, track_artist, track_album, track_duration_s, "
+                    "lyrics_source_id, lyrics_song_id, lyrics_digest FROM track_offsets "
+                    "ORDER BY updated_at DESC LIMIT -1 OFFSET ?)",
+                    (self._max_entries,),
                 )
         except (OSError, sqlite3.Error) as exc:
             raise TrackOffsetStoreError("track offset database upsert failed") from exc
