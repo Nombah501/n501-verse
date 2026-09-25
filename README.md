@@ -8,6 +8,8 @@ N501 Verse is an Omarchy bar plugin that keeps the current lyric line beside the
 
 [![N501 Verse karaoke demo](media/karaoke-demo.gif)](https://github.com/Nombah501/n501-verse/releases/download/demo-heart-on-redial/n501-verse-karaoke-demo.mp4)
 
+https://github.com/user-attachments/assets/19142124-f2f3-4cb3-a228-3a0ee2697282
+
 The full [46-second video with sound is on the release page](https://github.com/Nombah501/n501-verse/releases/tag/demo-heart-on-redial); everything shown is real plugin rendering, word-synced to the song.
 
 ![N501 Verse panel showing synchronized demo lyrics](preview.png)
