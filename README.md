@@ -4,6 +4,12 @@
 
 N501 Verse is an Omarchy bar plugin that keeps the current lyric line beside the music you are playing. It resolves lyrics locally first, works with the shared Kotonoha cache, and exposes a native panel for search, correction, and timing calibration.
 
+## Demo
+
+[![N501 Verse karaoke demo](media/karaoke-demo.gif)](https://github.com/Nombah501/n501-verse/releases/download/demo-heart-on-redial/n501-verse-karaoke-demo.mp4)
+
+The full [46-second video with sound is on the release page](https://github.com/Nombah501/n501-verse/releases/tag/demo-heart-on-redial); everything shown is real plugin rendering, word-synced to the song.
+
 ![N501 Verse panel showing synchronized demo lyrics](preview.png)
 
 Preview captured from the QML panel with synthetic demo metadata and lyrics.
@@ -139,6 +145,12 @@ KaraokeLine.qml        Current-line renderer
 KaraokeModel.js        Pure lyric projection logic
 bin/karaoke-lyrics     Kotonoha-backed resolver helper
 ```
+
+## Credits
+
+Music: "Heart On Redial" by Loveshadow, featuring Mana Junkie and Airtone — https://ccmixter.org/files/Loveshadow/26157 — CC BY 3.0 (https://creativecommons.org/licenses/by/3.0/); excerpt 1:15–1:57, faded out. Video made with video-shotcraft (https://github.com/Vincentwei1021/video-shotcraft, Apache-2.0) and Remotion (https://www.remotion.dev); sound effects from the video-shotcraft asset library (Mixkit license); wallpaper from the Omarchy retro-82 theme.
+
+CC BY 3.0 music applies only to the demo video, not to the plugin (MIT).
 
 ## License
 
