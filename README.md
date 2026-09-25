@@ -12,9 +12,9 @@ https://github.com/user-attachments/assets/19142124-f2f3-4cb3-a228-3a0ee2697282
 
 The full [46-second video with sound is on the release page](https://github.com/Nombah501/n501-verse/releases/tag/demo-heart-on-redial); everything shown is real plugin rendering, word-synced to the song.
 
-![N501 Verse panel showing synchronized demo lyrics](preview.png)
+![N501 Verse bar and panel showing word-synced lyrics for the demo track](preview.png)
 
-Preview captured from the QML panel with synthetic demo metadata and lyrics.
+Real bar widget and panel renders from the demo video ("Heart On Redial", see Credits), composited onto the Omarchy retro-82 wallpaper.
 
 **Bar in motion:** synchronized words fill as the track plays, then the next line appears. Recorded from the QML widget with synthetic demo lyrics.
 
