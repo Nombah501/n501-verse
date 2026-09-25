@@ -71,7 +71,7 @@ Panel {
     readonly property string musicGlyph: "󰎆"
     readonly property string verticalGlyph: {
         if (root.serviceState === "not_found") return "○"
-        if (root.serviceState === "provider_error" || root.serviceState === "dependency_error") return "!"
+        if (root.serviceState === "provider_error") return "!"
         return root.musicGlyph
     }
     readonly property string shownKey: root.serviceState + "|"
@@ -98,7 +98,6 @@ Panel {
     }
     readonly property alias button: barButton
     readonly property alias catcher: keyCatcher
-    readonly property alias installCommandField: installCommand
     readonly property alias failureGlyphText: failureGlyph.text
     readonly property bool barGlyphVisible: glyphText.visible
     readonly property alias failurePrimaryButton: failurePrimaryButton
@@ -159,6 +158,8 @@ Panel {
             parts.push("Lyrics were selected but the edited query was not saved")
         else if (root.lyricDocument.warnings.indexOf("alias_store_permissions") >= 0)
             parts.push("Lyrics were selected but the edited query was not saved")
+        if (root.lyricDocument.warnings.indexOf("kotonoha_import_failed") >= 0)
+            parts.push("Earlier Kotonoha selections could not be imported")
         return parts.join(" · ")
     }
     readonly property color panelForeground: bar ? bar.barForeground : Color.foreground
@@ -204,13 +205,10 @@ Panel {
     readonly property bool sharedNoticeVisible: root.lyricDocument
         && (String(root.lyricDocument.sourceKind || "") === "network"
             || String(root.lyricDocument.sourceKind || "") === "cache")
-    // Fetch-level failure key: dependency_error normalizes before any error
-    // code so the install guidance is never hidden by kotonoha_unavailable.
+    // Fetch-level failure key uses the helper error token when one is available.
     readonly property string failureKey: {
         if (root.searchMode) return ""
-        if (root.serviceState !== "not_found" && root.serviceState !== "dependency_error"
-                && root.serviceState !== "provider_error") return ""
-        if (root.serviceState === "dependency_error") return "dependency_error"
+        if (root.serviceState !== "not_found" && root.serviceState !== "provider_error") return ""
         if (karaokeService && karaokeService.errorCode) return String(karaokeService.errorCode)
         return root.serviceState
     }
@@ -228,7 +226,7 @@ Panel {
         if (!karaokeService || typeof karaokeService.capabilityExplanation !== "function") return ""
         if (karaokeService.capabilityExplanation("offset") === "") return ""
         if (!karaokeService.capabilities) return "Offset capabilities are unavailable"
-        return "This Kotonoha version does not support offset"
+        return "Timing offset is unavailable in this build"
     }
     readonly property string offsetDisabledHint: root.offsetSupportHint !== ""
         ? root.offsetSupportHint : "Timing offset needs a matched document"
@@ -236,7 +234,7 @@ Panel {
         if (!karaokeService || typeof karaokeService.capabilityExplanation !== "function") return ""
         if (karaokeService.capabilityExplanation("search") === "") return ""
         if (!karaokeService.capabilities) return "Search capabilities are unavailable"
-        return "This Kotonoha version does not support search"
+        return "Search is unavailable in this build"
     }
     readonly property bool searchOffline: !!karaokeService
         && karaokeService.networkMode === "Offline"
@@ -306,8 +304,7 @@ Panel {
     readonly property bool barTraceVisible: root.motionVisible && !root.vertical
         && ((root.serviceState === "loading" && root.loadingMotionReady)
             || root.timedGapVisible)
-    readonly property bool finalFailure: ["not_found", "provider_error", "dependency_error"]
-        .indexOf(root.serviceState) >= 0
+    readonly property bool finalFailure: ["not_found", "provider_error"].indexOf(root.serviceState) >= 0
     readonly property bool popupTraceVisible: root.opened && !root.searchMode
         && ((root.serviceState === "loading" && root.loadingMotionReady)
             || root.timedGapVisible)
@@ -390,8 +387,7 @@ Panel {
         if (!svc) return
         if (root.serviceState === "ready") {
             if (typeof svc.refreshCurrent === "function") svc.refreshCurrent()
-        } else if (root.serviceState === "not_found" || root.serviceState === "dependency_error"
-                || root.serviceState === "provider_error") {
+        } else if (root.serviceState === "not_found" || root.serviceState === "provider_error") {
             if (typeof svc.retry === "function") svc.retry()
         }
     }
@@ -472,13 +468,6 @@ Panel {
             return {message: "Saved correction could not be removed", action: "Try again"}
         case "alias_store_permissions":
             return {message: "Correction storage permissions blocked removal", action: "Try again"}
-        case "dependency_error":
-            return {message: "Install Kotonoha 0.2.3 separately", action: "Select setup link"}
-        case "kotonoha_unavailable":
-            // Surfaces in the search/select/forget views, whose own state
-            // (searchError/forgetError) is not normalized through
-            // failureKey/dependency_error the way the main fetch view is.
-            return {message: "Kotonoha provider library is unavailable", action: "Try again"}
         default:
             return {message: "No synchronized lyrics found", action: "Try again"}
         }
@@ -486,11 +475,6 @@ Panel {
 
     function failurePrimary() {
         var key = root.failureKey
-        if (key === "dependency_error") {
-            installCommand.selectAll()
-            installCommand.forceActiveFocus()
-            return
-        }
         if (key === "selection_not_found") {
             root.openSearch()
             return
@@ -787,12 +771,11 @@ Panel {
         var svc = root.karaokeService
         if (action === "refresh") return !!svc && svc.retryAvailable !== false
         if (action === "primary") {
-            // Only retry-type primaries use the fetch retry cooldown. The
-            // alias-unavailable Forget, Search-again, install-copy, and
-            // offset-retry primaries must stay available during cooldown.
+            // Only retry-type primaries use the fetch retry cooldown. Forget,
+            // Search-again, and offset-retry primaries stay available.
             var key = root.failureKey
             if (key === "alias_unavailable" || key === "selection_not_found"
-                    || key === "dependency_error" || key === "offset_store_failed")
+                    || key === "offset_store_failed")
                 return true
             return !!svc ? svc.retryAvailable !== false : true
         }
@@ -1099,11 +1082,13 @@ Panel {
         if (typeof diag.exitStatus === "string" && diag.exitStatus !== "")
             parts.push("status: " + diag.exitStatus)
         if (typeof diag.elapsedMs === "number") parts.push("elapsed: " + diag.elapsedMs + " ms")
-        if (typeof diag.kotonohaVersion === "string" && diag.kotonohaVersion !== "")
-            parts.push("kotonoha: " + diag.kotonohaVersion)
+        if (typeof diag.coreVersion === "string" && diag.coreVersion !== "")
+            parts.push("core: " + diag.coreVersion)
         // Optional-evidence fallback: capabilities without matchEvidence rank
         // by confidence/word-timing/provider order instead of match evidence.
         var caps = root.karaokeService ? root.karaokeService.capabilities : null
+        if (caps && caps.embedded === false)
+            parts.push("embedded tags: unavailable (needs python-mutagen)")
         if (!caps || caps.matchEvidence !== true)
             parts.push("match evidence: fallback ranking")
         return parts.join("\n")
@@ -1440,10 +1425,10 @@ Panel {
         PanelKeyCatcher {
             id: keyCatcher
             anchors.fill: parent
-            // Release every key to the query editors and the install-command
-            // editor while one holds focus so typing and copy work.
+            // Release every key to the query editors while one holds focus
+            // so typing and copy work.
             blocked: titleField.activeFocus || artistField.activeFocus
-                || albumField.activeFocus || installCommand.activeFocus
+                || albumField.activeFocus
             onCloseRequested: root.close()
             onTabRequested: function(direction) { root.switchPanel(direction) }
             onMoveRequested: function(dx, dy) { root.moveCursor(dx, dy) }
@@ -1724,27 +1709,6 @@ Panel {
                     font.family: root.panelFont
                     font.pixelSize: Style.font.caption
                     wrapMode: Text.Wrap
-                }
-
-                Column {
-                    width: parent.width
-                    spacing: Style.space(6)
-                    visible: root.failureKey === "dependency_error"
-                    TextEdit {
-                        id: installCommand
-                        width: parent.width
-                        height: implicitHeight
-                        textFormat: TextEdit.PlainText
-                        text: "https://github.com/locez/kotonoha/releases/tag/v0.2.3"
-                        color: Color.muted
-                        font.family: root.panelFont
-                        font.pixelSize: Style.font.caption
-                        readOnly: true
-                        selectByMouse: true
-                        selectByKeyboard: true
-                        wrapMode: TextEdit.WrapAnywhere
-                        horizontalAlignment: TextEdit.AlignHCenter
-                    }
                 }
 
                 // Visible actions sit before the long lyric list so the full

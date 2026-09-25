@@ -1,9 +1,10 @@
 #!/usr/bin/python3
-"""Fetch one synchronized lyric document through the installed Kotonoha stack."""
+"""Fetch one synchronized lyric document through the plugin-owned Lyrics Core."""
 from __future__ import annotations
 
 import argparse
 import asyncio
+import importlib.util
 import json
 import math
 import os
@@ -13,30 +14,38 @@ import time
 import urllib.parse
 from pathlib import Path
 from typing import Any, Iterable
+from contextlib import closing
+PLUGIN_DIR = Path(__file__).resolve().parent.parent
+# The plugin dir is a git-managed install checked by an exact allowlist:
+# never leave __pycache__ inside it when importing the Lyrics Core.
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(PLUGIN_DIR))
 
 try:
-    from kotonoha.lyrics.http import new_lyrics_session
-    from kotonoha.lyrics.artist_grammar import performing_artist
-    from kotonoha.lyrics.match import MatchConfidence, TrackMetadata
-    from kotonoha.lyrics.player_title_grammar import clean_player_title
-    from kotonoha.lyrics.title_grammar import recover_artist
-    from kotonoha.lyrics.netease import fetch_artifact as fetch_netease
-    from kotonoha.lyrics.netease import parse_payload as parse_netease
-    from kotonoha.lyrics.lrclib import fetch_artifact as fetch_lrclib
-    from kotonoha.lyrics.lrclib import parse_payload as parse_lrclib
-    from kotonoha.lyrics.kugou import fetch_artifact as fetch_kugou
-    from kotonoha.lyrics.kugou import parse_payload as parse_kugou
-    from kotonoha.lyrics.cache.models import LyricsCacheMode, LyricsCacheKey
-    from kotonoha.lyrics.cache.storage import LyricsCacheStorage, cache_path
+    from lyrics_core.lyrics.http import new_lyrics_session
+    from lyrics_core.lyrics.artist_grammar import performing_artist
+    from lyrics_core.lyrics.match import MatchConfidence, TrackMetadata
+    from lyrics_core.lyrics.player_title_grammar import clean_player_title
+    from lyrics_core.lyrics.title_grammar import recover_artist
+    from lyrics_core.lyrics.netease import fetch_artifact as fetch_netease
+    from lyrics_core.lyrics.netease import parse_payload as parse_netease
+    from lyrics_core.lyrics.lrclib import fetch_artifact as fetch_lrclib
+    from lyrics_core.lyrics.lrclib import parse_payload as parse_lrclib
+    from lyrics_core.lyrics.kugou import fetch_artifact as fetch_kugou
+    from lyrics_core.lyrics.kugou import parse_payload as parse_kugou
+    from lyrics_core.lyrics.cache.models import LyricsCacheMode, LyricsCacheKey
+    from lyrics_core.lyrics.cache.storage import LyricsCacheStorage, cache_path
+    from lyrics_core.kotonoha_import import ensure_cache_store, ensure_offset_store
+    from lyrics_core.state.track_offset_store import track_offset_path
 except (ImportError, ModuleNotFoundError) as exc:  # pragma: no cover - machine dependent
     IMPORT_ERROR = exc
 else:
     IMPORT_ERROR = None
 
 try:  # Optional local-file capability; never gates core fetch.
-    from kotonoha.lyrics.hint import from_player as _hint_from_player
-    from kotonoha.lyrics.local import load_local_lyrics as _load_local_lyrics
-    from kotonoha.lyrics.artifact import LyricsArtifact as _LyricsArtifact
+    from lyrics_core.lyrics.hint import from_player as _hint_from_player
+    from lyrics_core.lyrics.local import load_local_lyrics as _load_local_lyrics
+    from lyrics_core.lyrics.artifact import LyricsArtifact as _LyricsArtifact
 except (ImportError, ModuleNotFoundError, AttributeError):  # pragma: no cover - machine dependent
     _hint_from_player = None
     _load_local_lyrics = None
@@ -46,23 +55,23 @@ LOCAL_AVAILABLE = (
 )
 
 try:  # Optional match-evidence capability; never gates core fetch.
-    from kotonoha.lyrics.match import Candidate as _Candidate
-    from kotonoha.lyrics.match import evaluate_match as _evaluate_match
+    from lyrics_core.lyrics.match import Candidate as _Candidate
+    from lyrics_core.lyrics.match import evaluate_match as _evaluate_match
 except (ImportError, ModuleNotFoundError, AttributeError):
     _Candidate = None
     _evaluate_match = None
 MATCH_EVIDENCE_AVAILABLE = _Candidate is not None and _evaluate_match is not None
 
 try:  # Optional per-provider search capability; never gates core fetch.
-    from kotonoha.lyrics.netease import search_artifacts as _search_netease
+    from lyrics_core.lyrics.netease import search_artifacts as _search_netease
 except (ImportError, ModuleNotFoundError, AttributeError):  # pragma: no cover - machine dependent
     _search_netease = None
 try:
-    from kotonoha.lyrics.lrclib import search_artifacts as _search_lrclib
+    from lyrics_core.lyrics.lrclib import search_artifacts as _search_lrclib
 except (ImportError, ModuleNotFoundError, AttributeError):  # pragma: no cover - machine dependent
     _search_lrclib = None
 try:
-    from kotonoha.lyrics.kugou import search_artifacts as _search_kugou
+    from lyrics_core.lyrics.kugou import search_artifacts as _search_kugou
 except (ImportError, ModuleNotFoundError, AttributeError):  # pragma: no cover - machine dependent
     _search_kugou = None
 _SEARCH_AVAILABLE = {
@@ -71,13 +80,13 @@ _SEARCH_AVAILABLE = {
     "kugou": _search_kugou is not None,
 }
 try:  # Optional timing-offset capability; never gates core fetch.
-    from kotonoha.display.offsets import track_offset_key as _track_offset_key
-    from kotonoha.display.offsets import clamp_track_offset as _clamp_track_offset
-    from kotonoha.display.offsets import TrackIdentity as _TrackIdentity
-    from kotonoha.display.offsets import TrackOffsetKey as _TrackOffsetKey
-    from kotonoha.display.offsets import TrackOffsetEntry as _TrackOffsetEntry
-    from kotonoha.lyrics.adapter import LyricsDocumentAdapter as _LyricsDocumentAdapter
-    from kotonoha.state.track_offset_store import TrackOffsetStore as _TrackOffsetStore
+    from lyrics_core.display.offsets import track_offset_key as _track_offset_key
+    from lyrics_core.display.offsets import clamp_track_offset as _clamp_track_offset
+    from lyrics_core.display.offsets import TrackIdentity as _TrackIdentity
+    from lyrics_core.display.offsets import TrackOffsetKey as _TrackOffsetKey
+    from lyrics_core.display.offsets import TrackOffsetEntry as _TrackOffsetEntry
+    from lyrics_core.lyrics.adapter import LyricsDocumentAdapter as _LyricsDocumentAdapter
+    from lyrics_core.state.track_offset_store import TrackOffsetStore as _TrackOffsetStore
 except (ImportError, ModuleNotFoundError, AttributeError):  # pragma: no cover - machine dependent
     _track_offset_key = None
     _clamp_track_offset = None
@@ -1001,14 +1010,8 @@ async def fetch_lyrics(track: Any, request_id: int, *, storage: Any = None,
                        refresh: bool = False, url: Any = None, reported_title: Any = None,
                        offset_store: Any = None,
                        alias_db_path: Path | None = None) -> dict[str, Any]:
-    # A single overall deadline for this fetch, computed once here: the
-    # alias re-query pass (when a saved alias's manual cache entry is gone)
-    # and the ordinary provider pass each draw from what remains of it, so
-    # the two passes together cannot exceed `deadline` regardless of how the
-    # network time between them is split.
-    deadline_at = time.monotonic() + max(deadline, 0.0)
     if IMPORT_ERROR is not None and provider_specs is None:
-        return _error_response(request_id, track, "dependency_error", "kotonoha_unavailable")
+        return _error_response(request_id, track, "provider_error", "helper_unavailable")
     specs = provider_specs if provider_specs is not None else _providers()
     # Cache parsers stay complete so provider toggles narrow only network
     # requests and never break manual pins or cached hits.
@@ -1016,9 +1019,22 @@ async def fetch_lyrics(track: Any, request_id: int, *, storage: Any = None,
     if providers is not None:
         wanted = set(providers)
         specs = [spec for spec in specs if spec[0] in wanted]
+    import_warnings = []
     if storage is None and IMPORT_ERROR is None:
+        import_warnings = ensure_cache_store(cache_path())
         storage = LyricsCacheStorage(cache_path(), max_entries=1000)
-    warnings = _cache_permission_warnings(storage) if storage is not None else []
+        try:
+            with closing(storage._connect()):
+                pass
+        except Exception:
+            pass  # Preserve local lyrics even when the cache cannot be opened.
+    warnings = _merge_warnings(import_warnings, _cache_permission_warnings(storage)) if storage is not None else []
+    # A single overall deadline for this fetch, computed once here: the
+    # alias re-query pass (when a saved alias's manual cache entry is gone)
+    # and the ordinary provider pass each draw from what remains of it, so
+    # the two passes together cannot exceed `deadline` regardless of how the
+    # network time between them is split.
+    deadline_at = time.monotonic() + max(deadline, 0.0)
 
     try:
         local = _local_artifact(track, url)
@@ -1325,7 +1341,7 @@ async def search_provider(track: Any, request_id: int, provider: str, *,
                           query_track: Any = None) -> dict[str, Any]:
     lookup = query_track if query_track is not None else track
     if IMPORT_ERROR is not None and search_fns is None:
-        return _search_error(request_id, lookup, "dependency_error", "kotonoha_unavailable")
+        return _search_error(request_id, lookup, "provider_error", "helper_unavailable")
     try:
         found = await _search_artifacts_for(lookup, provider, search_fns=search_fns,
                                             session_factory=session_factory, timeout=timeout)
@@ -1374,16 +1390,24 @@ async def select_entry(track: Any, request_id: int, provider: str, song_id: str,
                        alias_db_path: Path | None = None) -> dict[str, Any]:
     lookup = query_track if query_track is not None else track
     if IMPORT_ERROR is not None and search_fns is None:
-        return _error_response(request_id, track, "dependency_error", "kotonoha_unavailable")
+        return _error_response(request_id, track, "provider_error", "helper_unavailable")
     if storage is None and IMPORT_ERROR is None:
+        warnings = _merge_warnings(warnings or [], ensure_cache_store(cache_path()))
         storage = LyricsCacheStorage(cache_path(), max_entries=1000)
+        try:
+            with closing(storage._connect()):
+                pass
+        except Exception:
+            pass  # A failed import must not prevent a normal search result.
     try:
         found = await _search_artifacts_for(lookup, provider, search_fns=search_fns,
                                             session_factory=session_factory, timeout=timeout)
     except _SearchUnavailable:
-        return _error_response(request_id, track, "provider_error", "search_unavailable")
+        return _error_response(request_id, track, "provider_error", "search_unavailable",
+                               warnings=warnings)
     except Exception:
-        return _error_response(request_id, track, "provider_error", "search_failed")
+        return _error_response(request_id, track, "provider_error", "search_failed",
+                               warnings=warnings)
     chosen = None
     for artifact in found or ():
         if str(getattr(artifact, "provider", "")) != provider:
@@ -1395,7 +1419,8 @@ async def select_entry(track: Any, request_id: int, provider: str, song_id: str,
         chosen = artifact
         break
     if chosen is None:
-        return _error_response(request_id, track, "not_found", "selection_not_found")
+        return _error_response(request_id, track, "not_found", "selection_not_found",
+                               warnings=warnings)
     query_title, query_artist, query_album, _duration = _track_fields(lookup)
     matched_title = str(getattr(chosen, "title", "") or "")
     matched_artist = str(getattr(chosen, "artist", "") or "")
@@ -1416,14 +1441,17 @@ async def select_entry(track: Any, request_id: int, provider: str, song_id: str,
                                        warnings=warnings, saved_alias=saved_alias)
         _attach_offset(track, reported_title, url, chosen, response, offset_store)
     except InvalidPayload:
-        return _error_response(request_id, track, "provider_error", "invalid_payload")
+        return _error_response(request_id, track, "provider_error", "invalid_payload",
+                               warnings=warnings)
     if not isinstance(response.get("providerSongId"), str) or not response["providerSongId"]:
-        return _error_response(request_id, track, "provider_error", "invalid_payload")
+        return _error_response(request_id, track, "provider_error", "invalid_payload",
+                               warnings=warnings)
     if storage is not None:
         try:
             manual_artifact = _rebuild_manual_artifact(chosen, track)
         except InvalidPayload:
-            return _error_response(request_id, track, "provider_error", "invalid_payload")
+            return _error_response(request_id, track, "provider_error", "invalid_payload",
+                                   warnings=warnings)
         try:
             storage.upsert(manual_artifact, LyricsCacheMode.MANUAL)
         except Exception:
@@ -1465,8 +1493,10 @@ def forget_entry(request_id: int, provider: str, song_id: str, *,
                  storage: Any = None, track: Any = None,
                  alias_db_path: Path | None = None) -> dict[str, Any]:
     if IMPORT_ERROR is not None and storage is None:
-        return _forget_response(request_id, "dependency_error", "", "kotonoha_unavailable")
+        return _forget_response(request_id, "provider_error", "", "helper_unavailable")
+    import_warnings = []
     if storage is None:
+        import_warnings = ensure_cache_store(cache_path())
         storage = LyricsCacheStorage(cache_path(), max_entries=1000)
     try:
         result = storage.delete(LyricsCacheKey(provider, song_id))
@@ -1487,7 +1517,9 @@ def forget_entry(request_id: int, provider: str, song_id: str, *,
             # panel preserves the saved selection.
             return _forget_response(request_id, "provider_error", delete_status,
                                     alias_status, alias_status)
-    return _forget_response(request_id, "ready", delete_status, "", alias_status)
+    response = _forget_response(request_id, "ready", delete_status, "", alias_status)
+    response["warnings"] = import_warnings
+    return response
 
 
 _OFFSET_MISSING = object()
@@ -1574,10 +1606,20 @@ def _offset_db_path(store: Any) -> Path | None:
     if isinstance(candidate, str) and candidate:
         return Path(candidate)
     try:
-        from kotonoha.state.track_offset_store import track_offset_path as _default_offset_path
+        from lyrics_core.state.track_offset_store import track_offset_path as _default_offset_path
         return _default_offset_path()
     except Exception:
         return None
+
+def _ensure_default_offset_store() -> list[str]:
+    path = track_offset_path()
+    warnings = ensure_offset_store(path)
+    if not path.exists():
+        try:
+            _TrackOffsetStore().load()
+        except Exception:
+            pass  # Fetch can still return lyrics if persistence is unavailable.
+    return _merge_warnings(warnings, _offset_permission_warnings(_TrackOffsetStore()))
 
 
 def _offset_permission_warnings(store: Any) -> list[str]:
@@ -1656,6 +1698,7 @@ def offset_write(request_id: int, key_json: Any, *, delta_ms: Any = _OFFSET_MISS
         key = _offset_key_from_json(data)
     except (ValueError, TypeError):
         raise ValueError("offset_key")
+    import_warnings = ensure_offset_store(track_offset_path()) if store is None and OFFSET_AVAILABLE else []
     storage = _offset_store_for(store)
     if storage is None:
         return _offset_response(request_id, "provider_error", 0, None, "offset_unavailable")
@@ -1678,7 +1721,7 @@ def offset_write(request_id: int, key_json: Any, *, delta_ms: Any = _OFFSET_MISS
     except Exception:
         permission_warnings = []
     return _offset_response(request_id, "ready", offset_ms, _offset_key_to_json(key), "",
-                            warnings=permission_warnings)
+                            warnings=_merge_warnings(import_warnings, permission_warnings))
 
 
 def _safe_output_text(value: Any) -> str:
@@ -1769,9 +1812,9 @@ def _bounded_capabilities_json(response: dict[str, Any]) -> str:
         "schemaVersion": SCHEMA_VERSION,
         "requestId": int(response.get("requestId", 0)),
         "status": "provider_error",
-        "kotonohaVersion": "",
-        "capabilities": {"local": False, "offset": False, "search": [],
-                         "matchEvidence": False},
+        "coreVersion": "",
+        "capabilities": {"local": False, "embedded": False, "offset": False,
+                         "search": [], "matchEvidence": False},
         "error": "payload_too_large",
     }, ensure_ascii=False, separators=(",", ":"))
 
@@ -1787,24 +1830,17 @@ def _normalize_providers(raw: str | None) -> list[str]:
     return [name for name in PROVIDER_ORDER if name in set(ids)]
 
 
-def _kotonoha_version() -> str:
-    version = ""
+def _core_version() -> str:
     try:
-        import importlib.metadata as metadata
-        version = str(metadata.version("kotonoha") or "")
+        from lyrics_core import __version__
+        return str(__version__ or "")[:MAX_VERSION_CHARS]
     except Exception:
-        version = ""
-    if not version:
-        try:
-            import kotonoha
-            version = str(getattr(kotonoha, "__version__", "") or "")
-        except Exception:
-            version = ""
-    return version[:MAX_VERSION_CHARS]
+        return ""
 
 def _capabilities_payload() -> dict[str, Any]:
     return {
         "local": bool(LOCAL_AVAILABLE),
+        "embedded": importlib.util.find_spec("mutagen") is not None,
         "offset": bool(OFFSET_AVAILABLE),
         "search": [name for name in PROVIDER_ORDER if _SEARCH_AVAILABLE.get(name, False)],
         "matchEvidence": bool(MATCH_EVIDENCE_AVAILABLE),
@@ -1815,10 +1851,10 @@ def capabilities_response(request_id: int) -> dict[str, Any]:
     return {
         "schemaVersion": SCHEMA_VERSION,
         "requestId": request_id,
-        "status": "ready",
-        "kotonohaVersion": _kotonoha_version(),
+        "status": "provider_error" if IMPORT_ERROR is not None else "ready",
+        "coreVersion": "" if IMPORT_ERROR is not None else _core_version(),
         "capabilities": _capabilities_payload(),
-        "error": "",
+        "error": "helper_unavailable" if IMPORT_ERROR is not None else "",
     }
 
 
@@ -1902,8 +1938,8 @@ def main(argv: list[str] | None = None) -> int:
         except (ValueError, TypeError, argparse.ArgumentError):
             print(_bounded_json(_error_response(request_id, empty_track, "provider_error", "invalid_request")))
             return 0
-        # The probe reports optional-feature support even when core imports
-        # failed; only an invalid request is an error.
+        # A missing Lyrics Core is reported as a helper failure, while
+        # optional capabilities remain available for diagnostics.
         print(_bounded_capabilities_json(capabilities_response(request_id)))
         return 0
     if args.action == "search":
@@ -1924,7 +1960,7 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if IMPORT_ERROR is not None:
             print(_bounded_search_json(_search_error(
-                request_id, empty_track, "dependency_error", "kotonoha_unavailable")))
+                request_id, empty_track, "provider_error", "helper_unavailable")))
             return 0
         try:
             if (args.query_title is not None or args.query_artist is not None
@@ -1939,7 +1975,7 @@ def main(argv: list[str] | None = None) -> int:
         except ValueError:
             response = _search_error(request_id, empty_track, "provider_error", "invalid_request")
         except Exception:
-            response = _search_error(request_id, empty_track, "dependency_error", "kotonoha_unavailable")
+            response = _search_error(request_id, empty_track, "provider_error", "helper_unavailable")
         print(_bounded_search_json(response))
         return 0
     if args.action == "select":
@@ -1957,7 +1993,7 @@ def main(argv: list[str] | None = None) -> int:
             print(_bounded_json(_error_response(request_id, empty_track, "provider_error", "invalid_request")))
             return 0
         if IMPORT_ERROR is not None:
-            print(_bounded_json(_error_response(request_id, empty_track, "dependency_error", "kotonoha_unavailable")))
+            print(_bounded_json(_error_response(request_id, empty_track, "provider_error", "helper_unavailable")))
             return 0
         try:
             track = _track_for_lookup(args.title, args.artist, args.album, args.duration)
@@ -1967,15 +2003,18 @@ def main(argv: list[str] | None = None) -> int:
                     args.query_title, args.query_artist, args.query_album)
             else:
                 query_track = _track_for_lookup(args.title, args.artist, args.album, args.duration)
+            offset_warnings = _ensure_default_offset_store() if OFFSET_AVAILABLE else []
             response = asyncio.run(select_entry(
                 track, request_id, args.provider, args.song_id,
                 reported_title=args.title,
                 offset_store=_TrackOffsetStore() if OFFSET_AVAILABLE else None,
                 query_track=query_track))
+            response["warnings"] = _merge_warnings(
+                _sanitize_warnings(response.get("warnings")), offset_warnings)
         except ValueError:
             response = _error_response(request_id, empty_track, "provider_error", "invalid_request")
         except Exception:
-            response = _error_response(request_id, empty_track, "dependency_error", "kotonoha_unavailable")
+            response = _error_response(request_id, empty_track, "provider_error", "helper_unavailable")
         print(_bounded_json(response))
         return 0
     if args.action == "forget":
@@ -1993,7 +2032,7 @@ def main(argv: list[str] | None = None) -> int:
             print(_bounded_forget_json(_forget_response(request_id, "provider_error", "", "invalid_request")))
             return 0
         if IMPORT_ERROR is not None:
-            print(_bounded_forget_json(_forget_response(request_id, "dependency_error", "", "kotonoha_unavailable")))
+            print(_bounded_forget_json(_forget_response(request_id, "provider_error", "", "helper_unavailable")))
             return 0
         try:
             track = _track_for_lookup(args.title, args.artist, args.album, args.duration)
@@ -2017,9 +2056,9 @@ def main(argv: list[str] | None = None) -> int:
         except (ValueError, TypeError, argparse.ArgumentError):
             print(_bounded_offset_json(_offset_response(request_id, "provider_error", 0, None, "invalid_request")))
             return 0
-        if IMPORT_ERROR is not None and not OFFSET_AVAILABLE:
+        if IMPORT_ERROR is not None:
             print(_bounded_offset_json(_offset_response(request_id, "provider_error", 0, None,
-                                             "offset_unavailable")))
+                                             "helper_unavailable")))
             return 0
         try:
             if delta is not None:
@@ -2029,7 +2068,7 @@ def main(argv: list[str] | None = None) -> int:
         except ValueError:
             response = _offset_response(request_id, "provider_error", 0, None, "invalid_request")
         except Exception:
-            response = _offset_response(request_id, "provider_error", 0, None, "kotonoha_unavailable")
+            response = _offset_response(request_id, "provider_error", 0, None, "helper_unavailable")
         print(_bounded_offset_json(response))
         return 0
     try:
@@ -2047,17 +2086,20 @@ def main(argv: list[str] | None = None) -> int:
         print(_bounded_json(_error_response(request_id, empty_track, "provider_error", "invalid_request")))
         return 0
     if IMPORT_ERROR is not None:
-        print(_bounded_json(_error_response(request_id, empty_track, "dependency_error", "kotonoha_unavailable")))
+        print(_bounded_json(_error_response(request_id, empty_track, "provider_error", "helper_unavailable")))
         return 0
     try:
         track = _track_for_lookup(args.title, args.artist, args.album, args.duration)
+        offset_warnings = _ensure_default_offset_store() if OFFSET_AVAILABLE else []
         response = asyncio.run(fetch_lyrics(track, request_id, network=network,
                                             providers=providers, refresh=refresh,
                                             url=getattr(args, "url", None),
                                             reported_title=args.title,
                                             offset_store=_TrackOffsetStore() if OFFSET_AVAILABLE else None))
+        response["warnings"] = _merge_warnings(
+            _sanitize_warnings(response.get("warnings")), offset_warnings)
     except Exception:
-        response = _error_response(request_id, empty_track, "dependency_error", "kotonoha_unavailable")
+        response = _error_response(request_id, empty_track, "provider_error", "helper_unavailable")
     print(_bounded_json(response))
     return 0
 

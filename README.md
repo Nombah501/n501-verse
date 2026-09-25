@@ -2,7 +2,7 @@
 
 > Synchronized lyrics that stay with your music.
 
-N501 Verse is an Omarchy bar plugin that keeps the current lyric line beside the music you are playing. It resolves lyrics locally first, works with the shared Kotonoha cache, and exposes a native panel for search, correction, and timing calibration.
+N501 Verse is an Omarchy bar plugin that keeps the current lyric line beside the music you are playing. It resolves lyrics locally first, keeps its own offline cache, and exposes a native panel for search, correction, and timing calibration.
 
 ## Demo
 
@@ -21,35 +21,23 @@ Preview captured from the QML panel with synthetic demo metadata and lyrics.
 ## Why N501 Verse
 
 - **Native to Omarchy** — a real bar widget and panel, not a separate overlay competing with the shell.
+- **Nothing else to install** — the lyrics resolver ships inside the plugin and runs on the system Python with no third-party packages.
 - **Local first** — adjacent sidecars and embedded lyrics take priority when the active player exposes a local file.
-- **Offline capable** — existing shared-cache entries remain available without network requests.
+- **Offline capable** — cached and pinned documents remain available without network requests.
 - **Honest timing** — word sync is shown only when the document contains complete word spans; ordinary LRC results remain line-timed.
 - **Correctable** — search one provider at a time, pin the exact result, forget it later.
 - **Tunable** — adjust a document-specific timing offset without rewriting the lyric file.
-- **Provider-neutral** — uses the installed Kotonoha stack instead of bundling another resolver or cache.
 
 ## Install
 
-Install Kotonoha **0.2.3** separately using the [official v0.2.3 release](https://github.com/locez/kotonoha/releases/tag/v0.2.3) and its [installation guide](https://github.com/locez/kotonoha/blob/v0.2.3/README.md#installation). N501 Verse does not install or update Kotonoha. Check the installed distribution and import with the system Python before adding the plugin:
-
-```bash
-/usr/bin/python3 -c 'from importlib.metadata import version; print(version("kotonoha"))'
-/usr/bin/python3 -c 'import kotonoha'
-```
-
-The first command must print exactly `0.2.3`; the second must exit successfully. `omarchy plugin add` installs only the plugin files and does **not** run `install.sh`. Then add and place the widget:
-
 ```bash
 omarchy plugin add https://github.com/Nombah501/n501-verse.git --enable --yes
-omarchy bar put n501.karaoke --after tablet-mode
-omarchy bar move n501.karaoke --section left --after tablet-mode
+omarchy bar move n501.karaoke --section left --index 999
 ```
 
+The first command installs and enables the plugin. The second places the widget last in the left section of the bar (the index is clamped to the section length); move it anywhere you like afterwards.
+
 The plugin keeps the technical ID `n501.karaoke` for stable configuration while presenting the product as **N501 Verse**.
-
-### Optional installer
-
-From a reviewed checkout, you can run `bash install.sh` instead of the three Omarchy commands above. It checks Kotonoha's installed version and import first, then adds or updates the plugin and places the widget. It never installs dependencies.
 
 ### Update or remove
 
@@ -58,15 +46,18 @@ omarchy plugin update n501.karaoke --yes
 omarchy plugin remove n501.karaoke --yes
 ```
 
+Updates keep the widget where you put it.
+
 The plugin runs inside `omarchy-shell` as unsandboxed QML/Python code. Review the source before enabling it.
 
 ## Requirements
 
 - Omarchy with third-party plugin support.
 - An active media player exposed through Omarchy's selected media service.
-- Kotonoha distribution version `0.2.3`, separately installed and importable by `/usr/bin/python3`.
+- The system `/usr/bin/python3`.
+- Optional: `python-mutagen` to read lyrics embedded in audio tags. Sidecar `.lrc` files work without it.
 
-No separate `playerctl` reader, player-specific integration, or credentials are required. Search corrections use a small plugin-owned SQLite database described below.
+No separate `playerctl` reader, player-specific integration, credentials, or other lyrics application are required.
 
 ## Timing you can trust
 
@@ -111,21 +102,17 @@ Provider availability, timing, rights, and correctness are not guaranteed. Netwo
 
 ## Privacy and storage
 
-- Network lookups happen only in **Auto** mode.
+- Network lookups happen only in **Auto** mode. LRCLIB requests identify the plugin in their `User-Agent`.
 - Local sidecars and embedded lyrics are read from the active local track; they are not sent to a network provider by the local-first path.
-- The shared lyric cache and timing offsets use Kotonoha's storage. The plugin does not create a second lyrics cache.
-- Search corrections are stored in `$XDG_STATE_HOME/n501.karaoke/search_aliases.sqlite3` (or `~/.local/state/n501.karaoke/search_aliases.sqlite3` when `XDG_STATE_HOME` is unset). This SQLite file holds original track metadata, the selected query, and the matched result identity; it stores no lyric bodies.
+- The lyrics cache lives in `$XDG_CACHE_HOME/n501.karaoke/lyrics.sqlite3` and timing offsets in `$XDG_STATE_HOME/n501.karaoke/track_offsets.sqlite3` (`~/.cache` and `~/.local/state` when the variables are unset). Directories are created `0700` and files `0600`.
+- Search corrections are stored in `$XDG_STATE_HOME/n501.karaoke/search_aliases.sqlite3`. This SQLite file holds original track metadata, the selected query, and the matched result identity; it stores no lyric bodies.
 - Diagnostics use bounded machine-readable errors and do not include lyric bodies, provider payloads, cookies, or headers.
 
+### Coming from Kotonoha or N501 Verse 0.3
+
+Earlier versions required Kotonoha and shared its cache. On first use, 0.4 copies your manually selected lyrics and timing offsets from Kotonoha's files once, opening them read-only; automatically found lyrics are simply resolved again. Kotonoha itself is no longer needed and its files are never modified. If that copy fails, the panel shows a one-time notice and lyrics keep working.
+
 ## Troubleshooting
-
-### The widget reports a dependency error
-
-Install Kotonoha `0.2.3` from the [official release](https://github.com/locez/kotonoha/releases/tag/v0.2.3), run the version and import checks above, then rescan the shell:
-
-```bash
-omarchy-shell shell rescanPlugins
-```
 
 ### No lyrics appear
 
@@ -135,6 +122,10 @@ Check that the player exposes stable title and artist metadata. In **Auto** mode
 
 That is expected when the selected document contains line timestamps without complete word spans. Try another provider or attach a word-timed local document; the UI keeps the limitation visible instead of fabricating progress.
 
+### Lyrics in audio tags are ignored
+
+Install `python-mutagen`. The panel's **Details** view reports `embedded tags: unavailable` while it is missing.
+
 ## Repository layout
 
 ```text
@@ -143,10 +134,13 @@ Panel.qml              Native bar widget and panel composition
 Service.qml            Playback lifecycle, lookup, correction, and offset owner
 KaraokeLine.qml        Current-line renderer
 KaraokeModel.js        Pure lyric projection logic
-bin/karaoke-lyrics     Kotonoha-backed resolver helper
+bin/karaoke-lyrics     Resolver helper (one JSON document per call)
+lyrics_core/           Lyrics Core: providers, parsers, matching, cache, offsets
 ```
 
 ## Credits
+
+The Lyrics Core is derived from [Kotonoha](https://github.com/locez/kotonoha) by Locez (MIT), at commit `175cfcc`; its license and provenance are in [`lyrics_core/`](lyrics_core/UPSTREAM.md).
 
 Music: "Heart On Redial" by Loveshadow, featuring Mana Junkie and Airtone — https://ccmixter.org/files/Loveshadow/26157 — CC BY 3.0 (https://creativecommons.org/licenses/by/3.0/); excerpt 1:15–1:57, faded out. Video made with video-shotcraft (https://github.com/Vincentwei1021/video-shotcraft, Apache-2.0) and Remotion (https://www.remotion.dev); sound effects from the video-shotcraft asset library (Mixkit license); wallpaper from the Omarchy retro-82 theme.
 
@@ -154,4 +148,4 @@ CC BY 3.0 music applies only to the demo video, not to the plugin (MIT).
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE). The Lyrics Core keeps Kotonoha's MIT notice in [`lyrics_core/LICENSE`](lyrics_core/LICENSE).

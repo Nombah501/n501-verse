@@ -54,7 +54,7 @@ Item {
     property int offsetSuccessSerial: 0
     readonly property bool offsetAvailable: root.offsetKey !== null && root.offsetKey !== undefined
     property var capabilities: null
-    property string kotonohaVersion: ""
+    property string coreVersion: ""
     property string capabilitiesError: ""
     property real capabilitiesProbedAtMs: 0
     property int capabilitiesFreshMs: 60000
@@ -599,7 +599,7 @@ Item {
             exitStatus: typeof exitStatus === "string" ? exitStatus : "",
             elapsedMs: typeof elapsedMs === "number" ? elapsedMs : 0,
             providerAttempts: safeAttempts,
-            kotonohaVersion: typeof root.kotonohaVersion === "string" ? root.kotonohaVersion.slice(0, 64) : ""
+            coreVersion: typeof root.coreVersion === "string" ? root.coreVersion.slice(0, 64) : ""
         }
         root.diagnosticSerial += 1
     }
@@ -655,7 +655,7 @@ Item {
                 root.elapsedFor(actionProcess), [])
             root.capabilitiesProbedAtMs = 0
             root.capabilities = null
-            root.kotonohaVersion = ""
+            root.coreVersion = ""
             root.capabilitiesError = "helper_unavailable"
             return
         }
@@ -908,10 +908,11 @@ Item {
         if (payload.schemaVersion !== 1) return false
         if (payload.status !== "ready") return false
         if (!root.validateErrorToken(payload.error === undefined ? "" : payload.error)) return false
-        if (typeof payload.kotonohaVersion !== "string") return false
+        if (typeof payload.coreVersion !== "string" || root.codePointLength(payload.coreVersion) > 64) return false
         var caps = payload.capabilities
         if (!caps || typeof caps !== "object") return false
         if (typeof caps.local !== "boolean" || typeof caps.offset !== "boolean") return false
+        if (caps.embedded !== undefined && typeof caps.embedded !== "boolean") return false
         if (typeof caps.matchEvidence !== "boolean") return false
         if (!Array.isArray(caps.search)) return false
         for (var i = 0; i < caps.search.length; i++) {
@@ -925,7 +926,7 @@ Item {
         if (!payload || typeof payload !== "object") return false
         if (payload.schemaVersion !== 1 || payload.requestId !== expectedId) return false
         if (!root.validateErrorToken(payload.error === undefined ? "" : payload.error)) return false
-        var statuses = ["ready", "not_found", "dependency_error", "provider_error"]
+        var statuses = ["ready", "not_found", "provider_error"]
         if (statuses.indexOf(payload.status) < 0) return false
         if (typeof payload.query !== "object" || !payload.query) return false
         if (typeof payload.query.title !== "string" || typeof payload.query.artist !== "string") return false
@@ -960,7 +961,7 @@ Item {
         if (!payload || typeof payload !== "object") return false
         if (payload.schemaVersion !== 1 || payload.requestId !== expectedId) return false
         if (!root.validateErrorToken(payload.error === undefined ? "" : payload.error)) return false
-        var statuses = ["ready", "not_found", "dependency_error", "provider_error"]
+        var statuses = ["ready", "not_found", "provider_error"]
         if (statuses.indexOf(payload.status) < 0) return false
         if (payload.status !== "ready") return true
         if (!(payload.deleteStatus === "deleted" || payload.deleteStatus === "not-found")) return false
@@ -1160,7 +1161,7 @@ Item {
                 root.capabilitiesProbedAtMs = 0
                 if (wasTimeout) {
                     root.capabilities = null
-                    root.kotonohaVersion = ""
+                    root.coreVersion = ""
                     root.capabilitiesError = "capabilities_unavailable"
                 } else if (!root.capabilities) {
                     root.capabilitiesError = "capabilities_unavailable"
@@ -1182,9 +1183,9 @@ Item {
         var nonzero = (typeof exitCode === "number" && exitCode !== 0) || exitStatus === "crash"
         if (kind === "capabilities") {
             if (parsed !== null && parsed.requestId === requestId && root.validateCapabilities(parsed)) {
+                parsed.capabilities.embedded = parsed.capabilities.embedded === true
                 root.capabilities = parsed.capabilities
-                root.kotonohaVersion = typeof parsed.kotonohaVersion === "string"
-                    ? parsed.kotonohaVersion.slice(0, 64) : ""
+                root.coreVersion = parsed.coreVersion
                 root.capabilitiesError = ""
                 root.capabilitiesProbedAtMs = Date.now()
                 root.recordDiagnostic(kind, "", exitCode, exitStatus,
@@ -1192,14 +1193,14 @@ Item {
             } else if (parsed === null && nonzero) {
                 root.capabilitiesProbedAtMs = 0
                 root.capabilities = null
-                root.kotonohaVersion = ""
+                root.coreVersion = ""
                 root.capabilitiesError = "helper_unavailable"
                 root.recordDiagnostic(kind, "helper_unavailable", exitCode, exitStatus,
                     root.elapsedFor(actionProcess), [])
             } else {
                 root.capabilitiesProbedAtMs = 0
                 root.capabilities = null
-                root.kotonohaVersion = ""
+                root.coreVersion = ""
                 root.capabilitiesError = "capabilities_unavailable"
                 root.recordDiagnostic(kind, "capabilities_unavailable", exitCode, exitStatus,
                     root.elapsedFor(actionProcess), [])
@@ -1337,7 +1338,7 @@ Item {
         if (expiredKind === "capabilities") {
             root.capabilitiesProbedAtMs = 0
             root.capabilities = null
-            root.kotonohaVersion = ""
+            root.coreVersion = ""
             root.capabilitiesError = "capabilities_unavailable"
             // Whether this probe's own timeout write is about to land, or
             // recordDiagnostic's capabilities guard is about to block it
@@ -1395,7 +1396,7 @@ Item {
         if (!root.validateErrorToken(response.error === undefined ? "" : response.error)) return false
         if (!root.validateAttempts(response.providerAttempts)) return false
         if (!root.validateSavedAlias(response.savedAlias)) return false
-        var statuses = ["ready", "not_found", "dependency_error", "provider_error"]
+        var statuses = ["ready", "not_found", "provider_error"]
         if (statuses.indexOf(response.status) < 0) return false
         if (response.warnings !== undefined) {
             if (!Array.isArray(response.warnings) || response.warnings.length > 16) return false
@@ -1483,7 +1484,7 @@ Item {
         if (!payload || typeof payload !== "object") return false
         if (payload.schemaVersion !== 1 || payload.requestId !== expectedId) return false
         if (!root.validateErrorToken(payload.error === undefined ? "" : payload.error)) return false
-        var statuses = ["ready", "provider_error", "dependency_error"]
+        var statuses = ["ready", "provider_error"]
         if (statuses.indexOf(payload.status) < 0) return false
         if (payload.warnings !== undefined) {
             if (!Array.isArray(payload.warnings) || payload.warnings.length > 16) return false
@@ -1527,8 +1528,7 @@ Item {
                 root.selectedSongId = typeof failedAlias.songId === "string" ? failedAlias.songId : ""
                 root.selectedCacheMode = "manual"
             }
-            if (failure === "helper_unavailable" || failure === "kotonoha_unavailable")
-                root.probeCapabilities(true)
+            if (failure === "helper_unavailable") root.probeCapabilities(true)
             else root.maybeScheduleAutomaticRetry()
             return
         }
@@ -1578,8 +1578,7 @@ Item {
                 root.selectedSongId = typeof validAlias.songId === "string" ? validAlias.songId : ""
                 root.selectedCacheMode = "manual"
             }
-            if (root.errorCode === "kotonoha_unavailable" || root.errorCode === "helper_unavailable")
-                root.probeCapabilities(true)
+            if (root.errorCode === "helper_unavailable") root.probeCapabilities(true)
             else root.maybeScheduleAutomaticRetry()
         }
     }
