@@ -6,29 +6,19 @@ N501 Verse fills the current lyric word by word, right in the Omarchy bar. It fi
 
 ![The N501 Verse bar filling lyrics word by word while the Omarchy theme changes](bar-demo.gif)
 
-Real bar renders (no mockups) of "Heart On Redial" (see Credits) with a local word-timed `.lrc`, switching through six stock Omarchy themes; the swatches are the three colours the plugin takes from each theme — bar background, text, and accent for the active word.
+Real bar renders (no mockups) cycling six stock Omarchy themes. The swatches are the three colours the plugin takes from each theme: bar background, text, and the accent for the active word.
 
-## Demo
+## At a glance
 
-[![N501 Verse karaoke demo](media/karaoke-demo.gif)](https://github.com/Nombah501/n501-verse/releases/download/demo-heart-on-redial/n501-verse-karaoke-demo.mp4)
+- 🎤 **Word by word** — the active word fills with your theme's accent; sung words stay bright, upcoming ones dim.
+- 🔎 **Finds lyrics on its own** — local `.lrc` and embedded tags first, then NetEase, LRCLIB and Kugou; each step is shown live.
+- 🎨 **Every theme** — bar, panel and fill take their colours from the active Omarchy theme, light or dark.
+- 🎬 **Every part of a song** — intro and interlude countdowns, pause, afterglow outro, long lines split to fit.
+- 🎧 **Any MPRIS player** — whatever Omarchy's media service follows: Spotify, browsers, mpv, VLC and others.
+- ✅ **Honest timing** — word sync only when the lyrics really carry word timing; otherwise it says *Line sync*.
+- 📴 **Nothing else to install** — the resolver ships inside the plugin, runs on the system Python, and works offline from local files and cache.
 
-https://github.com/user-attachments/assets/19142124-f2f3-4cb3-a228-3a0ee2697282
-
-The full [46-second video with sound is on the release page](https://github.com/Nombah501/n501-verse/releases/tag/demo-heart-on-redial); everything shown is real plugin rendering, word-synced to the song.
-
-![N501 Verse marketplace preview: the same lyric line in the tokyo-night, gruvbox and catppuccin-latte themes](preview.png)
-
-The marketplace preview: the same moment of the same line, rendered by the real widget in three themes.
-
-## Why N501 Verse
-
-- **Native to Omarchy** — a real bar widget and panel, not a separate overlay competing with the shell.
-- **Nothing else to install** — the lyrics resolver ships inside the plugin and runs on the system Python with no third-party packages.
-- **Local first** — adjacent sidecars and embedded lyrics take priority when the active player exposes a local file.
-- **Offline capable** — cached and pinned documents remain available without network requests.
-- **Honest timing** — word sync is shown only when the document contains complete word spans; ordinary LRC results remain line-timed.
-- **Correctable** — search one provider at a time, pin the exact result, forget it later.
-- **Tunable** — adjust a document-specific timing offset without rewriting the lyric file.
+![N501 Verse: the same lyric line rendered by the real widget in the tokyo-night, gruvbox and catppuccin-latte themes](preview.png)
 
 ## Install
 
@@ -61,25 +51,59 @@ The plugin runs inside `omarchy-shell` as unsandboxed QML/Python code. Review th
 
 No separate `playerctl` reader, player-specific integration, credentials, or other lyrics application are required.
 
+## How it finds lyrics
+
+```mermaid
+flowchart LR
+  A[Local lyrics<br/>.lrc sidecar · audio tags] -->|empty| B[Saved correction]
+  B -->|empty| C[Lyrics cache]
+  C -->|empty| D{Network<br/>Auto?}
+  D -->|yes| E[NetEase · LRCLIB · Kugou]
+  E --> F[Ranking]
+  D -->|Offline| G[Not found]
+  A -->|found| H((Lyrics))
+  B -->|found| H
+  C -->|found| H
+  F --> H
+```
+
+Each step stops at the first hit. With the network on, the enabled providers are asked and their answers ranked by how well they match the track. The bar shows the current step while it works; the panel lists every source's outcome.
+
+![The panel listing the lookup steps: Local lyrics, Saved correction and Lyrics Cache empty, NetEase found, then Ranking](media/lookup.gif)
+
+A real lookup of a track with no local lyrics, captured at real speed in the gruvbox theme.
+
+Found the wrong song? Middle-click opens manual search: query one provider, pin the exact result, forget it later.
+
 ## Timing you can trust
 
-N501 Verse distinguishes the document it actually received:
+The panel badge says which timing the lyrics actually carry:
 
-| Display | Meaning |
+| Badge | Meaning |
 | --- | --- |
-| **Word sync** | Complete word spans are available and the fill can move within a line. |
-| **Line sync** | The document has line timestamps but no complete word timing. |
-| **Word + line** | Some lines have complete word spans and others are line-timed. |
+| **Word sync** | Every line has word timing; the fill moves within the line. |
+| **Line sync** | Line timestamps only; the whole line lights up at once. |
+| **Word + line** | Some lines have word timing, others only line timing. |
 
-A provider advertising “synchronized lyrics” does not guarantee word timing. N501 Verse does not invent intra-line progress when the payload does not contain it.
+"Synchronized lyrics" from a provider does not guarantee word timing, and N501 Verse never invents it. If a track is out of step, `[` and `]` shift its lyrics by 100 ms; the offset is remembered for those lyrics.
 
 ## What the bar shows
 
-- **While lyrics are being found**, the bar shows the current step: local files, saved correction, cache, then each provider and its result (for example `NetEase · empty`). A fast cache hit shows nothing extra. The panel lists each provider's outcome.
-- **Long lines** that do not fit the bar are shown in parts, split at punctuation or at the longest pause between words. The panel wraps them instead.
-- **Word sync** fills the active word with the theme accent; sung words stay bright and upcoming words dimmer. A small accent mark flashes once when the first word-timed line of a track starts.
-- **Before the first line and during gaps of 3 seconds or more**, a wave runs, then a three-dot countdown with the next line shown dimmed.
-- **Pause** freezes the bar at half opacity with a ⏸ mark. **After the last line** the lyric fades into a short afterglow. **No lyrics or an error** settles into a static mark and a short reason.
+| | |
+| --- | --- |
+| ![Word sync: the active word fills with the gruvbox accent](media/word-sync.gif) | **Word sync.** The active word fills with the theme accent; sung words stay bright, upcoming words dim. A small accent mark flashes once when the first word-timed line of a track starts. |
+| ![A long line split into two parts in the Compact bar](media/segments.gif) | **Long lines.** A line wider than the bar is shown in parts, split at punctuation, at the longest pause between words, or at the most balanced point. The panel wraps it instead. |
+| ![Intro: a progress trace, then a three-dot countdown with the first line dimmed](media/intro.gif) | **Intro and interludes.** Before the first line and in gaps of 3 seconds or more, a trace runs, then a three-dot countdown with the next line shown dimmed. |
+| ![Pause: the bar freezes at half opacity with a pause mark, then resumes](media/pause.gif) | **Pause.** The bar freezes at half opacity with a ⏸ mark and picks up exactly where it stopped. |
+| ![Outro: the last line fades into an accent afterglow](media/outro.gif) | **Outro.** After the last line the lyric fades into a short afterglow, then a static mark. **No lyrics or an error** settles into the same mark with a short reason. |
+
+Clips: "Heart On Redial" (CC BY 3.0, see Credits) with a local word-timed `.lrc`, one Omarchy theme per clip.
+
+## The panel
+
+![The N501 Verse panel: track header with the Word sync badge and progress, Refresh, Search, timing offset and menu, and the lyric list with the active line filling](media/panel.png)
+
+Left-click the widget to open it: the whole lyric sheet with the active line highlighted and filling, the timing badge, **Refresh**, **Search**, the timing offset (`−` / `+`), and **⋯** for Details, Clear cache and more. Click a line to seek there.
 
 ## Controls
 
@@ -125,10 +149,6 @@ Provider availability, timing, rights, and correctness are not guaranteed. Netwo
 - **⋯ → Clear cache** in the panel removes only automatically found lyrics; they are fetched again on the next play. Lyrics you picked by hand, search corrections, and timing offsets stay. To remove everything, delete the three files above.
 - Diagnostics use bounded machine-readable errors and do not include lyric bodies, provider payloads, cookies, or headers.
 
-### Coming from Kotonoha or N501 Verse 0.3
-
-Earlier versions required Kotonoha and shared its cache. On first use, 0.4 copies your manually selected lyrics and timing offsets from Kotonoha's files once, opening them read-only; automatically found lyrics are simply resolved again. Kotonoha itself is no longer needed and its files are never modified. If that copy fails, the panel shows a one-time notice and lyrics keep working.
-
 ## Troubleshooting
 
 ### No lyrics appear
@@ -138,6 +158,10 @@ Check that the player exposes stable title and artist metadata. In **Auto** mode
 ### The result is line-timed instead of karaoke-style
 
 That is expected when the selected document contains line timestamps without complete word spans. Try another provider or attach a word-timed local document; the UI keeps the limitation visible instead of fabricating progress.
+
+### Coming from Kotonoha or N501 Verse 0.3
+
+Kotonoha is no longer needed: on first use, 0.4 and later copy your hand-picked lyrics and timing offsets from its files once (read-only) and resolve everything else again.
 
 ### Lyrics in audio tags are ignored
 
@@ -159,9 +183,7 @@ lyrics_core/           Lyrics Core: providers, parsers, matching, cache, offsets
 
 The Lyrics Core is derived from [Kotonoha](https://github.com/locez/kotonoha) by Locez (MIT), at commit `175cfcc`; its license and provenance are in [`lyrics_core/`](lyrics_core/UPSTREAM.md).
 
-Music: "Heart On Redial" by Loveshadow, featuring Mana Junkie and Airtone — https://ccmixter.org/files/Loveshadow/26157 — CC BY 3.0 (https://creativecommons.org/licenses/by/3.0/); excerpt 1:15–1:57, faded out. Video made with video-shotcraft (https://github.com/Vincentwei1021/video-shotcraft, Apache-2.0) and Remotion (https://www.remotion.dev); sound effects from the video-shotcraft asset library (Mixkit license); wallpaper from the Omarchy retro-82 theme.
-
-The theme GIF and the marketplace preview show lyric lines of the same track (1:30–1:38); their backgrounds are the stock wallpapers of the Omarchy tokyo-night, gruvbox, catppuccin, nord, matte-black and catppuccin-latte themes.
+Demo media: "Heart On Redial" by Loveshadow, featuring Mana Junkie and Airtone — https://ccmixter.org/files/Loveshadow/26157 — CC BY 3.0 (https://creativecommons.org/licenses/by/3.0/). The theme GIF, the preview, the bar clips and the panel show its lyrics (0:49–3:41) as rendered by the real widget from a local word-timed `.lrc`. The lookup clip shows only a track title and the lookup steps, no lyrics. Backgrounds are the stock wallpapers of the Omarchy tokyo-night, gruvbox, catppuccin, nord, matte-black and catppuccin-latte themes.
 
 CC BY 3.0 music and lyrics apply only to the demo media, not to the plugin (MIT).
 
