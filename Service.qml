@@ -26,6 +26,8 @@ Item {
     readonly property real interludeDuration: root.projectionSnapshot.interludeDuration
     readonly property real interludeProgress: root.projectionSnapshot.interludeProgress
     readonly property real afterLastElapsed: root.projectionSnapshot.afterLastElapsed
+    readonly property int countdownStep: root.projectionSnapshot.countdownStep || 0
+    readonly property var nextLine: root.projectionSnapshot.nextLine || null
     property var document: null
     property string provider: ""
     property string timing: "none"
@@ -75,6 +77,15 @@ Item {
     property string selectedCacheMode: ""
     property var savedAlias: null
     property var providerAttempts: []
+    property var resolutionSteps: []
+    property var resolutionStep: null
+    property string resolutionPhrase: ""
+    property bool resolutionVisible: false
+    property var pendingResolutionSteps: []
+    property real resolutionShownAt: 0
+    property real retryDueAt: 0
+    property int retrySeconds: 0
+    readonly property bool autoRetryPending: autoRetryTimer.running
     property var lastDiagnostic: null
     // Bumped by every recordDiagnostic write (fetch, search, select, forget,
     // offset, or a landed capabilities probe). A capabilities probe snapshots
@@ -101,8 +112,33 @@ Item {
     property var mprisPlayers: Mpris.players ? Mpris.players.values : []
     readonly property bool mprisFallbackEnabled: !root.mediaService && root.shell
         && typeof root.shell.pluginShellForBarEntry === "function"
-    readonly property var activePlayer: root.mediaService ? root.mediaService.activePlayer
+    readonly property var hostActivePlayer: root.mediaService ? root.mediaService.activePlayer
         : (root.mprisFallbackEnabled ? root.fallbackActivePlayer() : null)
+    // The last player seen playing. When it pauses and nothing else plays,
+    // Omarchy's selection falls back to any other player with metadata (a
+    // paused browser tab, KDE Connect); following that would start a
+    // Resolution for an unrelated track. Hold the paused player instead until
+    // another player actually plays, the held one disappears (QtObject
+    // auto-nulls), or the host reports no player at all.
+    property QtObject heldPlayer: null
+    readonly property bool heldPlayerUsable: root.heldPlayer !== null
+        && (root.textValue(root.heldPlayer.trackTitle) !== ""
+            || root.textValue(root.heldPlayer.trackArtist) !== "")
+    readonly property var activePlayer: {
+        var host = root.hostActivePlayer
+        if (!host || host.isPlaying === true || !root.heldPlayerUsable) return host
+        return root.heldPlayer
+    }
+    function syncHeldPlayer() {
+        var host = root.hostActivePlayer
+        if (host && host.isPlaying === true) root.heldPlayer = host
+    }
+    onHostActivePlayerChanged: root.syncHeldPlayer()
+    Connections {
+        target: root.hostActivePlayer
+        ignoreUnknownSignals: true
+        function onIsPlayingChanged() { root.syncHeldPlayer() }
+    }
     readonly property string trackKey: root.currentTrackKey()
     readonly property var lines: document && Array.isArray(document.lines) ? document.lines : []
     readonly property string timingDetail: KaraokeModel.timingDetail(root.lines)
@@ -304,6 +340,22 @@ Item {
 
     function clearLyrics(nextState) {
         var target = nextState || "idle"
+        if (target === "loading") {
+            root.resolutionSteps = []
+            root.resolutionStep = null
+            root.resolutionPhrase = ""
+            root.resolutionVisible = false
+            root.pendingResolutionSteps = []
+            root.resolutionShownAt = 0
+            root.retryDueAt = 0
+            resolutionStepTimer.stop()
+            retryCountdownTimer.stop()
+        } else {
+            resolutionRevealTimer.stop()
+            resolutionStepTimer.stop()
+            root.pendingResolutionSteps = []
+            root.resolutionVisible = false
+        }
         root.state = target
         root.publishProjectionSnapshot(root.neutralProjectionSnapshot(0))
         root.document = null
@@ -398,8 +450,7 @@ Item {
     }
 
     function cancelActionProcess() {
-        // Capability probes and cache clearing are track-independent: track
-        // settles and lookup resets let them land instead of losing them.
+        // Capability probes and cache clearing are track-independent.
         if (actionProcess.running && actionProcess.commandKind !== "capabilities"
                 && actionProcess.commandKind !== "clear-cache") {
             actionProcess.cancelled = true
@@ -475,11 +526,9 @@ Item {
         lyricProcess.exitCode = -1
         lyricProcess.exitStatus = ""
         lyricProcess.outputText = ""
-        // Per-run stdout collection: the prior run is terminal here (no
-        // running process, no pending exit wait), so retire its collector
-        // first. The new collector carries the immutable originating serial;
-        // a delayed old EOF has no live collector to complete through, and
-        // even a misdelivered callback is rejected by acceptLyricOutput.
+        // Per-run stdout parser: retire the prior terminal run before
+        // stamping the new parser with its immutable originating serial.
+        // Delayed lines from the old run are rejected by acceptLyricOutput.
         if (lyricProcess.activeCollector) lyricProcess.activeCollector.destroy()
         lyricProcess.activeCollector = lyricCollectorFactory.createObject(lyricProcess,
             {expectedSerial: lyricProcess.runSerial})
@@ -505,7 +554,9 @@ Item {
         if (request.url !== null && request.url !== undefined && request.url !== "")
             lyricProcess.command.push("--url", String(request.url))
         if (request.refresh === true) lyricProcess.command.push("--refresh")
+        if (request.retry === true) lyricProcess.command.push("--retry")
         lyricProcess.running = true
+        resolutionRevealTimer.restart()
         resolverWatchdog.restart()
     }
 
@@ -560,20 +611,31 @@ Item {
         autoRetryTimer.retryKey = key
         autoRetryTimer.retryGeneration = root.requestGeneration
         autoRetryTimer.restart()
+        root.retryDueAt = Date.now() + autoRetryTimer.interval
+        root.retrySeconds = 2
+        root.resolutionPhrase = "Network error · retry in 2s"
+        root.resolutionVisible = true
+        root.resolutionSteps = root.resolutionSteps.concat([{
+            stage: "retry", provider: "", outcome: "waiting"
+        }])
+        retryCountdownTimer.restart()
     }
 
     function startAutomaticRetry(capturedKey, capturedGeneration) {
-        if (capturedKey === "" || root.autoRetriedKey === capturedKey) return
-        if (capturedKey !== root.trackKey || capturedKey !== root.generationTrackKey) return
-        if (capturedGeneration !== root.requestGeneration) return
-        if (root.networkMode !== "Auto") return
+        if (capturedKey === "" || root.autoRetriedKey === capturedKey
+                || capturedKey !== root.trackKey || capturedKey !== root.generationTrackKey
+                || capturedGeneration !== root.requestGeneration) return
         var player = root.activePlayer
-        if (!player || player.isPlaying !== true) return
-        if (root.errorCode !== "providers_failed" && root.errorCode !== "resolver_timeout") return
+        if (root.networkMode !== "Auto" || !player || player.isPlaying !== true
+                || (root.errorCode !== "providers_failed" && root.errorCode !== "resolver_timeout")) {
+            root.finishResolutionFailure()
+            return
+        }
         root.autoRetriedKey = capturedKey
         root.requestGeneration += 1
         root.generationTrackKey = capturedKey
         root.pendingRequest = root.makeRequest(capturedKey)
+        if (root.pendingRequest) root.pendingRequest.retry = true
         root.cancelFetchProcess()
         root.cancelActionProcess()
         root.clearSearchState()
@@ -653,7 +715,7 @@ Item {
         root.waitingForActionExit = false
         actionWatchdog.stop()
         if (kind === "clear-cache") {
-            root.recordDiagnostic(kind, "helper_unavailable", -1, "",
+            if (!wasCancelled) root.recordDiagnostic(kind, "helper_unavailable", -1, "",
                 root.elapsedFor(actionProcess), [])
             root.cacheClearState = wasCancelled ? "" : "error"
             return
@@ -722,6 +784,7 @@ Item {
             root.clearLyrics("provider_error")
             root.errorCode = "resolver_timeout"
             root.maybeScheduleAutomaticRetry()
+            root.finishResolutionFailure()
         }
     }
 
@@ -1560,6 +1623,74 @@ Item {
         return root.validateOffsetKey(payload.offsetKey)
     }
 
+    function finishResolutionFailure() {
+        if (autoRetryTimer.running) return
+        var retryExhausted = root.autoRetriedKey === root.trackKey
+            && (root.errorCode === "providers_failed" || root.errorCode === "resolver_timeout")
+        var reason = root.state === "not_found" || retryExhausted ? "Not found"
+            : root.errorCode === "providers_failed" || root.errorCode === "resolver_timeout"
+                || root.errorCode === "network_disabled" ? "Network error"
+            : root.errorCode === "helper_unavailable" || root.errorCode === "invalid_response"
+                || root.errorCode === "invalid_payload" ? "Lyrics helper error"
+            : "Lyrics unavailable"
+        root.resolutionPhrase = reason + " · middle-click to search"
+        root.resolutionVisible = true
+        retryCountdownTimer.stop()
+    }
+
+    function providerLabel(provider) {
+        return ({lrclib: "LRCLIB", netease: "NetEase", kugou: "Kugou"})[provider] || provider
+    }
+
+    function stepPhrase(step) {
+        if (step.stage === "local") return "Local lyrics…"
+        if (step.stage === "alias") return "Saved correction…"
+        if (step.stage === "cache") return step.outcome === "found" ? "Found · Cache" : "Cache…"
+        if (step.stage === "ranking")
+            return step.outcome === "found" ? "Found · " + root.providerLabel(step.provider) : "Ranking…"
+        if (step.stage === "retry") return "Retrying…"
+        var name = root.providerLabel(step.provider)
+        return step.outcome === "query" ? name + "…" : name + " · " + step.outcome
+    }
+
+    function showNextResolutionStep() {
+        if (root.pendingResolutionSteps.length === 0 || root.state !== "loading"
+                || !root.resolutionVisible) return
+        if (root.resolutionStep !== null && Date.now() - root.resolutionShownAt < 400) {
+            resolutionStepTimer.interval = Math.max(1, 400 - (Date.now() - root.resolutionShownAt))
+            resolutionStepTimer.restart()
+            return
+        }
+        var queued = root.pendingResolutionSteps.slice()
+        root.resolutionStep = queued.shift()
+        root.pendingResolutionSteps = queued
+        root.resolutionShownAt = Date.now()
+        root.resolutionPhrase = root.stepPhrase(root.resolutionStep)
+        if (queued.length > 0) {
+            resolutionStepTimer.interval = 400
+            resolutionStepTimer.restart()
+        }
+    }
+
+    function acceptResolutionStep(step, requestId, requestKey) {
+        if (requestId !== root.requestGeneration || requestKey !== root.generationTrackKey
+                || requestKey !== root.trackKey || root.state !== "loading") return false
+        if (!step || step.schemaVersion !== 1 || step.type !== "step"
+                || step.requestId !== requestId
+                || ["local", "alias", "cache", "provider", "ranking", "retry"].indexOf(step.stage) < 0
+                || typeof step.provider !== "string" || typeof step.outcome !== "string"
+                || step.provider.length > 32 || step.outcome.length > 32
+                || (step.stage === "provider" && ["lrclib", "netease", "kugou"].indexOf(step.provider) < 0)
+                || ["checking", "query", "found", "empty", "timeout", "error", "start"].indexOf(step.outcome) < 0)
+            return false
+        root.resolutionSteps = root.resolutionSteps.concat([{
+            stage: step.stage, provider: step.provider, outcome: step.outcome
+        }])
+        root.pendingResolutionSteps = root.pendingResolutionSteps.concat([step])
+        root.showNextResolutionStep()
+        return true
+    }
+
     function applyResponse(raw, requestId, requestKey, exitCode, exitStatus) {
         if (requestId !== root.requestGeneration || requestKey !== root.generationTrackKey
                 || requestKey !== root.trackKey) return
@@ -1591,6 +1722,7 @@ Item {
             }
             if (failure === "helper_unavailable") root.probeCapabilities(true)
             else root.maybeScheduleAutomaticRetry()
+            root.finishResolutionFailure()
             return
         }
         if (parsed.status === "ready") {
@@ -1641,6 +1773,7 @@ Item {
             }
             if (root.errorCode === "helper_unavailable") root.probeCapabilities(true)
             else root.maybeScheduleAutomaticRetry()
+            root.finishResolutionFailure()
         }
     }
 
@@ -1673,16 +1806,17 @@ Item {
         if (!lyricProcess.outputReady || !lyricProcess.exitReady) return
         root.finalizeLyricOutput()
     }
-    // Origin-aware stdout publication for the lyric channel. Collectors pass
-    // the immutable serial stamped at their creation; the callback never
-    // reads the current serial, so a delayed EOF from a superseded run is
-    // rejected and cannot set outputReady/outputText for the replacement.
-    function acceptLyricOutput(originSerial, collector, text) {
+    // Each newline arrives while the process is still running. The collector
+    // serial and request identity fence steps just like the final response.
+    function acceptLyricOutput(originSerial, collector, line) {
         if (!collector || typeof originSerial !== "number") return false
-        if (originSerial !== lyricProcess.runSerial) return false
-        if (lyricProcess.stdout !== collector) return false
+        if (originSerial !== lyricProcess.runSerial || lyricProcess.stdout !== collector) return false
         if (lyricProcess.completed || lyricProcess.completedRun === originSerial) return false
-        lyricProcess.outputText = String(text || "")
+        var parsed = null
+        try { parsed = JSON.parse(String(line)) } catch (error) {}
+        if (parsed && parsed.type === "step")
+            return root.acceptResolutionStep(parsed, lyricProcess.requestId, lyricProcess.requestKey)
+        lyricProcess.outputText = String(line)
         lyricProcess.outputSerial = originSerial
         lyricProcess.outputReady = true
         if (lyricProcess.exitReady) root.maybeCompleteProcess()
@@ -1718,6 +1852,8 @@ Item {
         var interludeDuration = 0
         var interludeProgress = 0
         var afterLastElapsed = 0
+        var nextLine = null
+        var countdownStep = 0
 
         if (state === "line") {
             activeIndex = index
@@ -1727,18 +1863,24 @@ Item {
             leadInDuration = firstStart
             leadInProgress = firstStart > 0
                 ? Math.max(0, Math.min(1, displayPosition / firstStart)) : 1
+            if (firstStart >= KaraokeModel.interludeThreshold()) {
+                nextLine = root.lines[0]
+                countdownStep = KaraokeModel.countdownStep(firstStart, displayPosition)
+            }
         } else if (state === "interlude" && index >= 0 && index + 1 < root.lines.length) {
             interludeStart = effectiveEnd
             interludeEnd = Number(root.lines[index + 1].start)
             interludeDuration = Math.max(0, interludeEnd - interludeStart)
             interludeProgress = interludeDuration > 0
                 ? Math.max(0, Math.min(1, (displayPosition - interludeStart) / interludeDuration)) : 1
+            nextLine = root.lines[index + 1]
+            countdownStep = KaraokeModel.countdownStep(interludeEnd, displayPosition)
         } else if (state === "after_last") {
             afterLastElapsed = Math.max(0, displayPosition - effectiveEnd)
         }
 
         root.lastProjectionPosition = displayPosition
-        root.publishProjectionSnapshot({position: displayPosition, activeLineIndex: activeIndex, currentLine: current, projectionState: state, leadInDuration: leadInDuration, leadInProgress: leadInProgress, interludeStart: interludeStart, interludeEnd: interludeEnd, interludeDuration: interludeDuration, interludeProgress: interludeProgress, afterLastElapsed: afterLastElapsed})
+        root.publishProjectionSnapshot({position: displayPosition, activeLineIndex: activeIndex, currentLine: current, projectionState: state, leadInDuration: leadInDuration, leadInProgress: leadInProgress, interludeStart: interludeStart, interludeEnd: interludeEnd, interludeDuration: interludeDuration, interludeProgress: interludeProgress, afterLastElapsed: afterLastElapsed, nextLine: nextLine, countdownStep: countdownStep})
     }
 
     function updateProjectionTimer() {
@@ -1773,6 +1915,40 @@ Item {
         id: retryCooldownTimer
         interval: root.retryCooldownMs
         repeat: false
+    }
+
+    Timer {
+        id: resolutionRevealTimer
+        interval: 250
+        repeat: false
+        onTriggered: {
+            if (root.state === "loading") {
+                root.resolutionVisible = true
+                root.showNextResolutionStep()
+            }
+        }
+    }
+
+    Timer {
+        id: resolutionStepTimer
+        interval: 400
+        repeat: false
+        onTriggered: root.showNextResolutionStep()
+    }
+
+    Timer {
+        id: retryCountdownTimer
+        interval: 100
+        repeat: true
+        onTriggered: {
+            if (!autoRetryTimer.running) {
+                retryCountdownTimer.stop()
+                return
+            }
+            var seconds = Math.max(1, Math.ceil((root.retryDueAt - Date.now()) / 1000))
+            if (root.retrySeconds !== seconds) root.retrySeconds = seconds
+            root.resolutionPhrase = "Network error · retry in " + root.retrySeconds + "s"
+        }
     }
 
     Timer {
@@ -1852,20 +2028,15 @@ Item {
         onTriggered: root.handleActionKillTimeout()
     }
 
-    // Per-run stdout collectors. Each run gets a fresh StdioCollector whose
-    // expectedSerial is immutable: it is stamped at creation, before
-    // running = true, and never read back from the (possibly already
-    // replaced) current serial. A delayed EOF from a superseded run carries
-    // the old serial and is rejected by acceptLyricOutput/acceptActionOutput,
-    // so it can never set outputReady/outputText for the replacement.
+    // Per-run parsers carry an immutable serial stamped before running=true.
+    // Old process lines cannot publish into the replacement request.
     Component {
         id: lyricCollectorFactory
-        StdioCollector {
+        SplitParser {
             id: lyricCollector
             property int expectedSerial: -1
-            waitForEnd: true
-            onStreamFinished: root.acceptLyricOutput(lyricCollector.expectedSerial, lyricCollector,
-                lyricCollector.text)
+            splitMarker: "\n"
+            onRead: data => root.acceptLyricOutput(lyricCollector.expectedSerial, lyricCollector, data)
         }
     }
 
@@ -2043,5 +2214,8 @@ Item {
     onTimingChanged: root.updateProjectionTimer()
     onStateChanged: root.updateProjectionTimer()
 
-    Component.onCompleted: root.bindMediaService()
+    Component.onCompleted: {
+        root.bindMediaService()
+        root.syncHeldPlayer()
+    }
 }

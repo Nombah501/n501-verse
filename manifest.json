@@ -1,10 +1,10 @@
 {
   "schemaVersion": 1,
   "id": "n501.karaoke",
-  "name": "N501 Verse",
-  "version": "0.4.1",
+  "name": "N501 Verse: Word-Synced Lyrics",
+  "version": "0.5.0",
   "author": "n501",
-  "description": "Synchronized lyrics that stay with your music.",
+  "description": "Word-by-word karaoke lyrics right in your Omarchy bar. Finds synced lyrics automatically — local .lrc, NetEase, LRCLIB, Kugou — works with any MPRIS player, and recolors itself with every theme.",
   "license": "MIT",
   "kinds": ["service", "bar-widget"],
   "entryPoints": {

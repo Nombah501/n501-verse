@@ -10,109 +10,192 @@ Item {
     property real position: 0
     property bool wordTiming: false
     property bool playing: true
+    property bool segmentEnabled: true
+    property bool wrapEnabled: false
+    property color accent: Color.accent
     property color foreground: Color.accent
     property color muted: Color.muted
     property string fontFamily: Style.font.family
     property real fontSize: Style.font.body
-    readonly property var projection: KaraokeModel.projectLine(line, position)
-    readonly property string filledText: projection.filledText || ""
-    readonly property string activeWordText: projection.activeWordText || ""
-    readonly property string remainingText: projection.remainingText || ""
-    readonly property real wordProgress: Number(projection.wordProgress) || 0
-    readonly property bool hasWordTiming: wordTiming && projection.hasWordTiming === true
+    readonly property color upcoming: Qt.rgba(root.foreground.r, root.foreground.g,
+        root.foreground.b, 0.62)
+    readonly property var paintedText: currentLayer.paintText
+
+    FontMetrics {
+        id: segmentMetrics
+        font.family: root.fontFamily
+        font.pixelSize: root.fontSize
+    }
+
+    readonly property var segments: {
+        var family = root.fontFamily
+        var size = root.fontSize
+        if (!root.line) return []
+        return root.segmentEnabled
+            ? KaraokeModel.segmentLine(root.line, function(text) {
+                return segmentMetrics.advanceWidth(text)
+            }, root.width)
+            : [root.line]
+    }
+    readonly property int segmentIndex: root.segmentEnabled
+        ? KaraokeModel.activeSegmentIndex(root.line, root.segments, root.position) : 0
+    readonly property var currentSegment: root.segments[root.segmentIndex] || null
+    property var displayedSegment: null
+    readonly property real fullWidth: root.currentSegment
+        ? Math.min(root.width, currentLayer.fullWidth) : 0
 
     implicitWidth: 1
-    implicitHeight: Math.max(Style.font.body, fullText.implicitHeight)
+    implicitHeight: Math.max(Style.font.body, currentLayer.implicitHeight)
     clip: true
 
-    TextMetrics {
-        id: fullMetrics
-        font: fullText.font
-        text: projection.text || ""
+    onCurrentSegmentChanged: {
+        if (root.displayedSegment === root.currentSegment) return
+        fadeOut.stop()
+        fadeIn.stop()
+        if (root.playing && root.displayedSegment && root.currentSegment) {
+            previousLayer.segment = root.displayedSegment
+            previousLayer.playbackPosition = root.position
+            previousLayer.opacity = 1
+            fadeOut.restart()
+            currentLayer.opacity = 0
+            fadeIn.restart()
+        } else {
+            previousLayer.opacity = 0
+            currentLayer.opacity = 1
+        }
+        root.displayedSegment = root.currentSegment
+    }
+    onPlayingChanged: {
+        if (!root.playing) {
+            fadeOut.stop()
+            fadeIn.stop()
+            previousLayer.opacity = 0
+            currentLayer.opacity = 1
+        }
     }
 
-    TextMetrics {
-        id: untimedPrefixMetrics
-        font: fullText.font
-        text: projection.untimedPrefixText || ""
-    }
-
-    TextMetrics {
-        id: timedPrefixMetrics
-        font: fullText.font
-        text: projection.timedPrefixText || ""
-    }
-
-    TextMetrics {
-        id: prefixMetrics
-        font: fullText.font
-        text: projection.prefixText || ""
-    }
-
-    TextMetrics {
-        id: currentWordMetrics
-        font: fullText.font
-        text: projection.activeWordText || ""
-    }
-
-    readonly property real fullWidth: Math.max(0, fullMetrics.advanceWidth)
-    readonly property real fillStartWidth: Math.max(0, untimedPrefixMetrics.advanceWidth)
-    readonly property real fillWidth: root.hasWordTiming
-        ? Math.max(0, Math.min(root.fullWidth,
-            root.fillStartWidth + timedPrefixMetrics.advanceWidth
-                + currentWordMetrics.advanceWidth * root.wordProgress))
-        : 0
-    readonly property real panOffset: {
-        if (root.fullWidth <= root.width || !root.hasWordTiming) return 0
-        var center = prefixMetrics.advanceWidth + currentWordMetrics.advanceWidth * 0.5
-        return Math.max(0, Math.min(root.fullWidth - root.width, center - root.width * 0.5))
-    }
-
-    Item {
-        id: viewport
-        anchors.fill: parent
+    component LyricLayer: Item {
+        id: layer
+        property var segment: null
+        property real playbackPosition: 0
+        readonly property var projection: KaraokeModel.projectLine(segment, playbackPosition)
+        readonly property bool hasWordTiming: root.wordTiming && projection.hasWordTiming === true
+        readonly property real fullWidth: Math.max(0, fullMetrics.advanceWidth)
+        readonly property real fillStartWidth: Math.max(0, untimedPrefixMetrics.advanceWidth)
+        readonly property real sungWidth: layer.fillStartWidth + timedPrefixMetrics.advanceWidth
+        readonly property real activeWidth: currentWordMetrics.advanceWidth
+            * (Number(projection.wordProgress) || 0)
+        readonly property var paintText: fullText
+        implicitHeight: fullText.implicitHeight
         clip: true
 
-        Item {
-            id: content
-            x: -root.panOffset
-            width: Math.max(root.fullWidth, viewport.width)
-            height: viewport.height
+        TextMetrics {
+            id: fullMetrics
+            font: fullText.font
+            text: layer.projection.text || ""
+        }
+        TextMetrics {
+            id: untimedPrefixMetrics
+            font: fullText.font
+            text: layer.projection.untimedPrefixText || ""
+        }
+        TextMetrics {
+            id: timedPrefixMetrics
+            font: fullText.font
+            text: layer.projection.timedPrefixText || ""
+        }
+        TextMetrics {
+            id: currentWordMetrics
+            font: fullText.font
+            text: layer.projection.activeWordText || ""
+        }
 
+        Text {
+            id: fullText
+            anchors.verticalCenter: parent.verticalCenter
+            width: root.wrapEnabled ? layer.width
+                : layer.hasWordTiming && !(layer.segment && layer.segment.elide)
+                    ? implicitWidth : layer.width
+            textFormat: root.wrapEnabled && layer.hasWordTiming ? Text.StyledText : Text.PlainText
+            text: root.wrapEnabled && layer.hasWordTiming
+                ? KaraokeModel.styledWordLine(layer.segment, layer.playbackPosition,
+                    root.foreground.toString(), root.accent.toString(), root.upcoming.toString())
+                : layer.projection.text || ""
+            color: root.foreground
+            opacity: layer.hasWordTiming && !root.wrapEnabled ? 0.62 : 1
+            font.family: root.fontFamily
+            font.pixelSize: root.fontSize
+            wrapMode: root.wrapEnabled ? Text.Wrap : Text.NoWrap
+            horizontalAlignment: root.wrapEnabled ? Text.AlignHCenter : Text.AlignLeft
+            elide: layer.segment && layer.segment.elide ? Text.ElideRight : Text.ElideNone
+            verticalAlignment: Text.AlignVCenter
+        }
+
+        Item {
+            visible: layer.hasWordTiming && !root.wrapEnabled
+            width: layer.sungWidth
+            anchors.top: parent.top
+            anchors.bottom: parent.bottom
+            clip: true
             Text {
-                id: fullText
                 anchors.verticalCenter: parent.verticalCenter
-                width: root.hasWordTiming ? fullText.implicitWidth : viewport.width
+                width: layer.segment && layer.segment.elide ? layer.width : layer.fullWidth
                 textFormat: Text.PlainText
-                text: root.projection.text || ""
-                color: root.hasWordTiming ? root.muted : root.foreground
+                text: layer.projection.text || ""
+                color: root.foreground
                 font.family: root.fontFamily
                 font.pixelSize: root.fontSize
-                elide: root.hasWordTiming ? Text.ElideNone : Text.ElideRight
-                verticalAlignment: Text.AlignVCenter
-            }
-
-            Item {
-                id: accentClip
-                visible: root.hasWordTiming
-                x: root.fillStartWidth
-                anchors.top: parent.top
-                anchors.bottom: parent.bottom
-                width: Math.max(0, root.fillWidth - root.fillStartWidth)
-                clip: true
-
-                Text {
-                    anchors.verticalCenter: parent.verticalCenter
-                    textFormat: Text.PlainText
-                    text: root.projection.timedText || ""
-                    color: root.foreground
-                    opacity: root.playing ? 1.0 : 0.55
-                    font.family: root.fontFamily
-                    font.pixelSize: root.fontSize
-                    elide: Text.ElideNone
-                    verticalAlignment: Text.AlignVCenter
-                }
+                elide: layer.segment && layer.segment.elide ? Text.ElideRight : Text.ElideNone
             }
         }
+        Item {
+            visible: layer.hasWordTiming && !root.wrapEnabled
+            x: layer.sungWidth
+            width: Math.max(0, Math.min(layer.activeWidth, layer.width - x))
+            anchors.top: parent.top
+            anchors.bottom: parent.bottom
+            clip: true
+            Text {
+                x: -layer.sungWidth
+                anchors.verticalCenter: parent.verticalCenter
+                width: layer.segment && layer.segment.elide ? layer.width : layer.fullWidth
+                textFormat: Text.PlainText
+                text: layer.projection.text || ""
+                color: root.accent
+                opacity: root.playing ? 1 : 0.55
+                font.family: root.fontFamily
+                font.pixelSize: root.fontSize
+                elide: layer.segment && layer.segment.elide ? Text.ElideRight : Text.ElideNone
+            }
+        }
+
+    }
+
+    LyricLayer {
+        id: previousLayer
+        anchors.fill: parent
+        opacity: 0
+    }
+    LyricLayer {
+        id: currentLayer
+        anchors.fill: parent
+        segment: root.currentSegment
+        playbackPosition: root.position
+    }
+    NumberAnimation {
+        id: fadeOut
+        target: previousLayer
+        property: "opacity"
+        to: 0
+        duration: 120
+        easing.type: Easing.OutCubic
+    }
+    NumberAnimation {
+        id: fadeIn
+        target: currentLayer
+        property: "opacity"
+        to: 1
+        duration: 210
+        easing.type: Easing.OutCubic
     }
 }

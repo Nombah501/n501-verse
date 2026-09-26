@@ -906,7 +906,7 @@ def _normalize_query_override(raw_title: Any, raw_artist: Any, raw_album: Any) -
 
 async def _fetch_network(track: Any, providers: list[tuple[str, Any, Any]], session_factory: Any,
                          deadline: float,
-                         consider: Any = None) -> tuple[list[tuple[Any, Any]], int, int, int, list[dict[str, Any]]]:
+                         consider: Any = None, on_attempt: Any = None) -> tuple[list[tuple[Any, Any]], int, int, int, list[dict[str, Any]]]:
 
     if not providers:
         return [], 0, 0, 0, []
@@ -918,6 +918,12 @@ async def _fetch_network(track: Any, providers: list[tuple[str, Any, Any]], sess
     clean = 0
     usable = 0
     attempts: list[dict[str, Any]] = []
+    def record(name: str, outcome: str) -> None:
+        attempts.append({"provider": name, "outcome": outcome})
+        if on_attempt is not None:
+            on_attempt(name, {"candidate": "found", "not_found": "empty",
+                              "rejected": "error"}.get(outcome, outcome))
+
     winners: list[tuple[Any, Any]] = []
     try:
         deadline_at = time.monotonic() + max(deadline, 0.0)
@@ -928,39 +934,41 @@ async def _fetch_network(track: Any, providers: list[tuple[str, Any, Any]], sess
             # Each provider is capped at min(remaining, 8s); skipped providers
             # are absent from attempts. Only this coroutine is cancelled.
             budget = min(remaining, PROVIDER_SUB_BUDGET_S)
+            if on_attempt is not None:
+                on_attempt(name, "query")
             try:
                 artifact = await asyncio.wait_for(fetch(session, track, fuzzy=True), timeout=budget)
             except (asyncio.TimeoutError, TimeoutError):
-                attempts.append({"provider": name, "outcome": "timeout"})
+                record(name, "timeout")
                 continue
             except asyncio.CancelledError:
                 raise
             except Exception:
-                attempts.append({"provider": name, "outcome": "error"})
+                record(name, "error")
                 continue
             completed += 1
             if artifact is None:
                 clean += 1
-                attempts.append({"provider": name, "outcome": "not_found"})
+                record(name, "not_found")
                 continue
             if _confidence_rank(getattr(artifact, "confidence", "none")) == 0:
                 clean += 1
-                attempts.append({"provider": name, "outcome": "not_found"})
+                record(name, "not_found")
                 continue
             usable += 1
             doc = None
             try:
                 doc = consider(artifact) if consider is not None else artifact
             except InvalidPayload:
-                attempts.append({"provider": name, "outcome": "rejected"})
+                record(name, "rejected")
                 continue
             except Exception:
-                attempts.append({"provider": name, "outcome": "error"})
+                record(name, "error")
                 continue
             if doc is None:
-                attempts.append({"provider": name, "outcome": "rejected"})
+                record(name, "rejected")
                 continue
-            attempts.append({"provider": name, "outcome": "candidate"})
+            record(name, "candidate")
             winners.append((artifact, doc))
             # Early stop only for provider-high, fully word-timed artifacts:
             # every line must carry valid complete word timing. Mixed
@@ -1009,7 +1017,14 @@ async def fetch_lyrics(track: Any, request_id: int, *, storage: Any = None,
                        network: str = "auto", providers: list[str] | None = None,
                        refresh: bool = False, url: Any = None, reported_title: Any = None,
                        offset_store: Any = None,
-                       alias_db_path: Path | None = None) -> dict[str, Any]:
+                       alias_db_path: Path | None = None,
+                       on_step: Any = None, retry: bool = False) -> dict[str, Any]:
+    def step(stage: str, provider: str = "", outcome: str = "") -> None:
+        if on_step is not None:
+            on_step(stage, provider, outcome)
+
+    if retry:
+        step("retry", outcome="start")
     if IMPORT_ERROR is not None and provider_specs is None:
         return _error_response(request_id, track, "provider_error", "helper_unavailable")
     specs = provider_specs if provider_specs is not None else _providers()
@@ -1036,6 +1051,7 @@ async def fetch_lyrics(track: Any, request_id: int, *, storage: Any = None,
     # network time between them is split.
     deadline_at = time.monotonic() + max(deadline, 0.0)
 
+    step("local", outcome="checking")
     try:
         local = _local_artifact(track, url)
     except Exception:
@@ -1046,16 +1062,20 @@ async def fetch_lyrics(track: Any, request_id: int, *, storage: Any = None,
                                            source_kind="local", cache_mode="none",
                                            warnings=warnings)
             _attach_offset(track, reported_title, url, local, response, offset_store)
+            step("local", "local", "found")
             return response
         except InvalidPayload:
             pass
+    step("local", outcome="empty")
 
     # Saved corrections are authoritative after local lyrics. The alias key
     # uses _track_for_lookup-normalized playback identity; fetch callers must
     # pass an already-normalized track.
+    step("alias", outcome="checking")
     alias, alias_warnings = _alias_load(track, alias_db_path)
     warnings = _merge_warnings(warnings, alias_warnings)
     saved_alias = alias
+    step("alias", alias["provider"] if alias else "", "found" if alias else "empty")
     # Attempts from the alias re-query, kept only when that query actually
     # falls through to ordinary resolution below: the alias provider was
     # genuinely contacted and must be reported alongside the ordinary
@@ -1084,6 +1104,7 @@ async def fetch_lyrics(track: Any, request_id: int, *, storage: Any = None,
                     response["title"] = alias["matchedTitle"] or response["title"]
                     response["artist"] = alias["matchedArtist"] or response["artist"]
                     response["album"] = alias["matchedAlbum"] or response["album"]
+                    step("alias", alias_provider, "found")
                     return response
                 except InvalidPayload:
                     pass
@@ -1114,7 +1135,8 @@ async def fetch_lyrics(track: Any, request_id: int, *, storage: Any = None,
 
             winners, _completed, _clean, _usable, alias_attempts = await _fetch_network(
                 query_track, alias_specs, session_factory or new_lyrics_session,
-                max(deadline_at - time.monotonic(), 0.0), alias_consider)
+                max(deadline_at - time.monotonic(), 0.0), alias_consider,
+                lambda name, outcome: step("provider", name, outcome))
             if winners:
                 artifact = winners[0][0]
                 try:
@@ -1180,6 +1202,7 @@ async def fetch_lyrics(track: Any, request_id: int, *, storage: Any = None,
             # again.
             pass
 
+    step("cache", outcome="checking")
     candidates: list[tuple[Any, str]] = []
     if storage is not None:
         candidates = _cache_candidates(storage, track, parsers, include_automatic=not refresh)
@@ -1192,10 +1215,12 @@ async def fetch_lyrics(track: Any, request_id: int, *, storage: Any = None,
                                                source_kind="cache", cache_mode=cache_mode,
                                                warnings=warnings, saved_alias=saved_alias)
                 _attach_offset(track, reported_title, url, cached, response, offset_store)
+                step("cache", str(getattr(cached, "provider", "")), "found")
                 return response
             except InvalidPayload:
                 continue
 
+    step("cache", outcome="empty")
     network_off = network != "auto"
     if network_off or not specs:
         return _error_response(request_id, track, "not_found", "network_disabled",
@@ -1210,12 +1235,15 @@ async def fetch_lyrics(track: Any, request_id: int, *, storage: Any = None,
 
     winners, completed, clean, usable, attempts = await _fetch_network(
         track, specs, session_factory or new_lyrics_session,
-        max(deadline_at - time.monotonic(), 0.0), consider)
+        max(deadline_at - time.monotonic(), 0.0), consider,
+        lambda name, outcome: step("provider", name, outcome))
     attempts = alias_fallthrough_attempts + attempts
+    step("ranking", outcome="start")
     if winners:
         docs_by_artifact = {id(artifact): doc for artifact, doc in winners}
         for candidate in _ranked([artifact for artifact, _doc in winners], track):
             response = docs_by_artifact[id(candidate)]
+            step("ranking", str(getattr(candidate, "provider", "")), "found")
             response["providerAttempts"] = _sanitize_attempts(attempts)
             response["savedAlias"] = _sanitize_alias(saved_alias)
             if storage is not None and _confidence_value(getattr(candidate, "confidence", "")) == "high":
@@ -1758,6 +1786,12 @@ def _safe_output_text(value: Any) -> str:
     return str(value or "")[:1024]
 
 
+def _print_step(request_id: int, stage: str, provider: str, outcome: str) -> None:
+    print(json.dumps({"schemaVersion": SCHEMA_VERSION, "requestId": request_id,
+                      "type": "step", "stage": stage, "provider": provider,
+                      "outcome": outcome}, separators=(",", ":")), flush=True)
+
+
 def _bounded_json(response: dict[str, Any]) -> str:
     raw = json.dumps(response, ensure_ascii=False, separators=(",", ":"))
     if len(raw.encode("utf-8")) <= MAX_OUTPUT_BYTES:
@@ -1901,6 +1935,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     fetch.add_argument("--network", default="auto")
     fetch.add_argument("--providers", default=None)
     fetch.add_argument("--refresh", action="store_true")
+    fetch.add_argument("--retry", action="store_true")
     capabilities = subparsers.add_parser("capabilities")
     capabilities.add_argument("--request-id", type=int, required=True)
     search = subparsers.add_parser("search")
@@ -2132,10 +2167,12 @@ def main(argv: list[str] | None = None) -> int:
         track = _track_for_lookup(args.title, args.artist, args.album, args.duration)
         offset_warnings = _ensure_default_offset_store() if OFFSET_AVAILABLE else []
         response = asyncio.run(fetch_lyrics(track, request_id, network=network,
-                                            providers=providers, refresh=refresh,
+                                            providers=providers, refresh=refresh, retry=args.retry,
                                             url=getattr(args, "url", None),
                                             reported_title=args.title,
-                                            offset_store=_TrackOffsetStore() if OFFSET_AVAILABLE else None))
+                                            offset_store=_TrackOffsetStore() if OFFSET_AVAILABLE else None,
+                                            on_step=lambda stage, provider, outcome:
+                                                _print_step(request_id, stage, provider, outcome)))
         response["warnings"] = _merge_warnings(
             _sanitize_warnings(response.get("warnings")), offset_warnings)
     except Exception:

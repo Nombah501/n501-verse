@@ -1,8 +1,12 @@
 # N501 Verse
 
-> Synchronized lyrics that stay with your music.
+> Every word, on the beat — word-synced lyrics in your Omarchy bar.
 
-N501 Verse is an Omarchy bar plugin that keeps the current lyric line beside the music you are playing. It resolves lyrics locally first, keeps its own offline cache, and exposes a native panel for search, correction, and timing calibration.
+N501 Verse fills the current lyric word by word, right in the Omarchy bar. It finds synced lyrics on its own — your local `.lrc` files first, then NetEase, LRCLIB and Kugou — follows any MPRIS player, and recolors itself with every Omarchy theme.
+
+![The N501 Verse bar filling lyrics word by word while the Omarchy theme changes](bar-demo.gif)
+
+Real bar renders (no mockups) of "Heart On Redial" (see Credits) with a local word-timed `.lrc`, switching through six stock Omarchy themes; the swatches are the three colours the plugin takes from each theme — bar background, text, and accent for the active word.
 
 ## Demo
 
@@ -12,13 +16,9 @@ https://github.com/user-attachments/assets/19142124-f2f3-4cb3-a228-3a0ee2697282
 
 The full [46-second video with sound is on the release page](https://github.com/Nombah501/n501-verse/releases/tag/demo-heart-on-redial); everything shown is real plugin rendering, word-synced to the song.
 
-![N501 Verse bar and panel showing word-synced lyrics for the demo track](preview.png)
+![N501 Verse marketplace preview: the same lyric line in the tokyo-night, gruvbox and catppuccin-latte themes](preview.png)
 
-Real bar widget and panel renders from the demo video ("Heart On Redial", see Credits), composited onto the Omarchy retro-82 wallpaper.
-
-**Bar in motion:** synchronized words fill as the track plays, then the next line appears. Recorded from the QML widget with synthetic demo lyrics.
-
-![Animated N501 Verse bar filling karaoke words and advancing to the next line](bar-demo.gif)
+The marketplace preview: the same moment of the same line, rendered by the real widget in three themes.
 
 ## Why N501 Verse
 
@@ -73,6 +73,14 @@ N501 Verse distinguishes the document it actually received:
 
 A provider advertising “synchronized lyrics” does not guarantee word timing. N501 Verse does not invent intra-line progress when the payload does not contain it.
 
+## What the bar shows
+
+- **While lyrics are being found**, the bar shows the current step: local files, saved correction, cache, then each provider and its result (for example `NetEase · empty`). A fast cache hit shows nothing extra. The panel lists each provider's outcome.
+- **Long lines** that do not fit the bar are shown in parts, split at punctuation or at the longest pause between words. The panel wraps them instead.
+- **Word sync** fills the active word with the theme accent; sung words stay bright and upcoming words dimmer. A small accent mark flashes once when the first word-timed line of a track starts.
+- **Before the first line and during gaps of 3 seconds or more**, a wave runs, then a three-dot countdown with the next line shown dimmed.
+- **Pause** freezes the bar at half opacity with a ⏸ mark. **After the last line** the lyric fades into a short afterglow. **No lyrics or an error** settles into a static mark and a short reason.
+
 ## Controls
 
 | Input | Action |
@@ -98,7 +106,7 @@ A provider advertising “synchronized lyrics” does not guarantee word timing.
 - **LRCLIB** — free community source; ordinary results are line-timed.
 - **Kugou** — experimental community source; word timing depends on availability.
 - **Translations** — show or hide translated lines when supplied.
-- **Motion** — animate the loading trace. Timestamp progress and synchronized word fill remain visible when motion is off.
+- **Motion** — animate waves, the countdown, and the search shimmer. With motion off, states are shown statically; timestamp progress and word fill remain.
 
 Provider availability, timing, rights, and correctness are not guaranteed. Network and cache documents are for personal display; lyric rights remain with their respective owners.
 
@@ -114,7 +122,7 @@ Provider availability, timing, rights, and correctness are not guaranteed. Netwo
   | `$XDG_STATE_HOME/n501.karaoke/track_offsets.sqlite3` | Timing offsets | 5,000 entries; the least recently changed go first |
   | `$XDG_STATE_HOME/n501.karaoke/search_aliases.sqlite3` | Search corrections: original track metadata, the query, and the matched result identity; no lyric text | 1,000 entries; the least recently saved go first |
 
-- **Details → Clear cache** removes only automatically found lyrics; they are fetched again on the next play. Lyrics you picked by hand, search corrections, and timing offsets stay. To remove everything, delete the three files above.
+- **⋯ → Clear cache** in the panel removes only automatically found lyrics; they are fetched again on the next play. Lyrics you picked by hand, search corrections, and timing offsets stay. To remove everything, delete the three files above.
 - Diagnostics use bounded machine-readable errors and do not include lyric bodies, provider payloads, cookies, or headers.
 
 ### Coming from Kotonoha or N501 Verse 0.3
@@ -133,7 +141,7 @@ That is expected when the selected document contains line timestamps without com
 
 ### Lyrics in audio tags are ignored
 
-Install `python-mutagen`. The panel's **Details** view reports `embedded tags: unavailable` while it is missing.
+Install `python-mutagen`. The panel's **⋯ → Details** view reports `embedded tags: unavailable` while it is missing.
 
 ## Repository layout
 
@@ -153,7 +161,9 @@ The Lyrics Core is derived from [Kotonoha](https://github.com/locez/kotonoha) by
 
 Music: "Heart On Redial" by Loveshadow, featuring Mana Junkie and Airtone — https://ccmixter.org/files/Loveshadow/26157 — CC BY 3.0 (https://creativecommons.org/licenses/by/3.0/); excerpt 1:15–1:57, faded out. Video made with video-shotcraft (https://github.com/Vincentwei1021/video-shotcraft, Apache-2.0) and Remotion (https://www.remotion.dev); sound effects from the video-shotcraft asset library (Mixkit license); wallpaper from the Omarchy retro-82 theme.
 
-CC BY 3.0 music applies only to the demo video, not to the plugin (MIT).
+The theme GIF and the marketplace preview show lyric lines of the same track (1:30–1:38); their backgrounds are the stock wallpapers of the Omarchy tokyo-night, gruvbox, catppuccin, nord, matte-black and catppuccin-latte themes.
+
+CC BY 3.0 music and lyrics apply only to the demo media, not to the plugin (MIT).
 
 ## License
 

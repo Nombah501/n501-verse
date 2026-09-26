@@ -60,8 +60,13 @@ Panel {
             if (line !== "") text += "\n" + line
             text += "\nClick: panel · Right: refresh · Middle: search"
             if (root.offsetControlsAvailable) text += " · Wheel: timing"
+        } else if (root.serviceState === "loading" && karaokeService
+                && karaokeService.resolutionVisible) {
+            text += "\n" + String(karaokeService.resolutionPhrase || "Resolving lyrics…")
         } else if (root.serviceState === "loading") {
-            text += "\nLoading synchronized lyrics…"
+            text += "\nResolving lyrics…"
+        } else if (root.resolutionStatusVisible) {
+            text += "\n" + root.resolutionPhrase
         } else if (root.failureVisible) {
             text += "\n" + root.failureMessage
         }
@@ -102,11 +107,76 @@ Panel {
     readonly property bool barGlyphVisible: glyphText.visible
     readonly property alias failurePrimaryButton: failurePrimaryButton
     readonly property alias failureDetailsButton: failureDetailsButton
+    readonly property alias resolutionHeadingVisible: statusText.visible
+    readonly property alias failureSummaryVisible: failureSummary.visible
     // The lyric clip keeps its size across line and progress states.
     readonly property alias lyricClipItem: lineItem
+    readonly property bool wordSyncGlyphVisible: wordSyncGlyph.visible && wordSyncGlyph.opacity > 0
+    readonly property string wordSyncTrackKey: karaokeService ? String(karaokeService.trackKey || "") : ""
+    property string confirmedWordSyncTrackKey: ""
+    readonly property bool firstWordLineDue: {
+        var svc = root.karaokeService
+        if (!root.ready || !svc || !svc.currentLine || svc.projectionState !== "line"
+                || svc.timing !== "word" || !Array.isArray(svc.lines)) return false
+        for (var i = 0; i < svc.lines.length; i++) {
+            if (KaraokeModel.lineHasWordTiming(svc.lines[i]))
+                return svc.currentLine === svc.lines[i] && svc.position >= svc.lines[i].start
+        }
+        return false
+    }
+    function showWordSyncGlyph() {
+        if (!root.firstWordLineDue || !root.wordSyncTrackKey
+                || root.confirmedWordSyncTrackKey === root.wordSyncTrackKey) return
+        root.confirmedWordSyncTrackKey = root.wordSyncTrackKey
+        wordSyncFade.stop()
+        wordSyncGlyph.opacity = 1
+        wordSyncTimer.restart()
+    }
+    onFirstWordLineDueChanged: root.showWordSyncGlyph()
+    onWordSyncTrackKeyChanged: {
+        wordSyncTimer.stop()
+        wordSyncFade.stop()
+        wordSyncGlyph.opacity = 0
+        root.confirmedWordSyncTrackKey = ""
+        Qt.callLater(root.showWordSyncGlyph)
+    }
+    Timer {
+        id: wordSyncTimer
+        interval: 1200
+        onTriggered: {
+            if (root.motionEnabled) wordSyncFade.restart()
+            else wordSyncGlyph.opacity = 0
+        }
+    }
+    NumberAnimation {
+        id: wordSyncFade
+        target: wordSyncGlyph
+        property: "opacity"
+        to: 0
+        duration: 180
+        easing.type: Easing.OutCubic
+    }
+    function activePanelRowHeight() {
+        var svc = root.karaokeService
+        var row = svc ? lyricList.itemAtIndex(svc.activeLineIndex) : null
+        return row ? row.height : 0
+    }
+    function activePanelPaintText() {
+        var svc = root.karaokeService
+        var row = svc ? lyricList.itemAtIndex(svc.activeLineIndex) : null
+        return row ? row.activePaintText : null
+    }
     // Public observable for popup sizing: the smoke asserts the panel
     // content width follows the configured bar mode.
     readonly property alias popupContentWidth: popup.contentWidth
+    readonly property real readyActionsY: readyActions.y
+    readonly property real lyricListY: lyricList.y
+    readonly property bool barMarksClearOfLyric: wordSyncGlyph.x + wordSyncGlyph.implicitWidth <= lineItem.x
+        && pauseMark.x + pauseMark.implicitWidth <= lineItem.x
+    readonly property bool menuCardVisible: menuCard.visible
+    readonly property real menuCardTop: menuAnchor.y + menuCard.y
+    readonly property real readyActionsBottom: readyActions.y + readyActions.height
+    readonly property bool matchedDetailVisible: matchedDetail.visible
     // Public observable for the deferred search-title focus path: smoke and
     // keybindings assert this instead of reaching into private field ids.
     readonly property alias searchTitleField: titleField
@@ -135,6 +205,7 @@ Panel {
     property bool offsetWritePending: false
     property bool offsetFlashVisible: false
     property bool showDiagnostics: false
+    property bool menuOpen: false
     property real wheelRemainder: 0
     readonly property var lyricDocument: karaokeService && karaokeService.document ? karaokeService.document : null
     readonly property string provenanceLabel: {
@@ -162,7 +233,15 @@ Panel {
             parts.push("Earlier Kotonoha selections could not be imported")
         return parts.join(" · ")
     }
-    readonly property color panelForeground: bar ? bar.barForeground : Color.foreground
+    // The popup surface is Color.popups.background regardless of the bar: a
+    // transparent bar recolours bar.barForeground for the wallpaper, which
+    // would make popup text unreadable on the popup's own background.
+    readonly property color panelForeground: Color.popups.text
+    readonly property color secondaryForeground: Qt.rgba(panelForeground.r, panelForeground.g,
+        panelForeground.b, 0.62)
+    readonly property color barTextColor: bar ? bar.barForeground : Color.bar.text
+    readonly property color barSecondaryForeground: Qt.rgba(barTextColor.r, barTextColor.g,
+        barTextColor.b, 0.62)
     readonly property string panelFont: bar ? bar.fontFamily : Style.font.family
     readonly property string panelTiming: {
         if (karaokeService && karaokeService.timing === "word" && karaokeService.timingDetail === "mixed")
@@ -213,12 +292,49 @@ Panel {
         return root.serviceState
     }
     readonly property bool failureVisible: root.failureKey !== ""
+    readonly property bool resolutionStatusVisible: !root.searchMode
+        && root.serviceState === "loading" && !!root.karaokeService
+        && root.karaokeService.resolutionVisible === true
+    readonly property string resolutionPhrase: root.resolutionStatusVisible
+        ? String(root.karaokeService.resolutionPhrase || "") : ""
+    readonly property var resolutionTimeline: {
+        var steps = root.karaokeService && Array.isArray(root.karaokeService.resolutionSteps)
+            ? root.karaokeService.resolutionSteps : []
+        var rows = []
+        var indices = ({})
+        for (var i = 0; i < steps.length; i++) {
+            var step = steps[i]
+            if (step.stage === "ranking" && step.outcome !== "found") continue
+            var key = step.stage === "provider" ? step.stage + ":" + step.provider : step.stage
+            if (indices[key] === undefined) {
+                indices[key] = rows.length
+                rows.push(step)
+            } else rows[indices[key]] = step
+        }
+        return rows
+    }
+    readonly property string failureProviderSummary: {
+        var parts = []
+        for (var i = 0; i < root.resolutionTimeline.length; i++) {
+            var step = root.resolutionTimeline[i]
+            if (step.stage === "provider" && step.outcome !== "query")
+                parts.push(root.resolutionStepText(step))
+        }
+        return parts.join(", ")
+    }
+    function resolutionStepText(step) {
+        var label = ({local: "Local lyrics", alias: "Saved correction",
+            cache: "Lyrics Cache", ranking: "Ranking", retry: "Retry"})[step.stage]
+            || (root.karaokeService && root.karaokeService.providerLabel
+                ? root.karaokeService.providerLabel(step.provider) : step.provider)
+        return label + " · " + (step.outcome === "query" || step.outcome === "checking"
+            ? "…" : step.outcome)
+    }
     readonly property string failureMessage: root.failureCopy(root.failureKey).message
     readonly property string failureActionText: root.failureCopy(root.failureKey).action
     readonly property string offsetText: {
         var ms = karaokeService ? Math.trunc(Number(karaokeService.offsetMs) || 0) : 0
-        if (ms === 0) return "Lyrics ±0 ms"
-        return "Lyrics " + (ms > 0 ? "+" : "-") + Math.abs(ms) + " ms"
+        return (ms < 0 ? "−" : "+") + Math.abs(ms) + " ms"
     }
     readonly property bool offsetControlsAvailable: !!karaokeService
         && karaokeService.offsetAvailable === true
@@ -304,7 +420,6 @@ Panel {
     property string loadingSnapshotArtist: ""
     property bool loadingHandoffPending: false
     property bool loadingMotionReady: false
-    property bool loadingLabelReady: false
     readonly property bool motionVisible: root.visible && !(root.bar && root.bar.barHidden === true)
     readonly property bool isPlaying: !!karaokeService && !!karaokeService.activePlayer
         && karaokeService.activePlayer.isPlaying === true
@@ -312,18 +427,60 @@ Panel {
         ? String(root.karaokeService.projectionState || "") : ""
     readonly property bool beforeFirstSceneVisible: root.projectionState === "before_first"
         && root.karaokeService
-        && Number(root.karaokeService.leadInDuration || 0)
-            - KaraokeModel.interludeThreshold() > 1e-9
+        && Number(root.karaokeService.leadInDuration || 0) >= KaraokeModel.interludeThreshold()
     readonly property bool loadingHandoffVisible: root.serviceState === "loading"
         && root.loadingHandoffPending && !root.loadingMotionReady
     readonly property bool loadingSnapshotVisible: !root.vertical
         && root.loadingHandoffVisible && root.loadingSnapshotText !== ""
     readonly property bool timedGapVisible: root.ready
         && (root.beforeFirstSceneVisible || root.projectionState === "interlude")
+    readonly property int countdownStep: root.timedGapVisible && root.karaokeService
+        ? Number(root.karaokeService.countdownStep || 0) : 0
+    readonly property bool countdownVisible: root.motionVisible && !root.vertical
+        && root.timedGapVisible && root.countdownStep > 0
+    readonly property string countdownDots: root.countdownStep === 3 ? "● ● ●"
+        : root.countdownStep === 2 ? "● ● ○" : "● ○ ○"
+    readonly property bool pauseSceneVisible: root.motionVisible && !root.vertical
+        && root.ready && !root.isPlaying
+    readonly property bool resolutionShimmerRunning: root.motionEnabled && root.motionVisible
+        && root.isPlaying && root.resolutionStatusVisible && root.resolutionPhrase !== ""
+        && !root.vertical
+    readonly property string previewSegmentText: root.countdownVisible && previewLine.currentSegment
+        ? String(previewLine.currentSegment.text || "") : ""
+    readonly property bool countdownDotsVisible: countdownRow.visible
+    readonly property bool introBreathingAnimationRunning: introBreath.running
+    readonly property real barTraceOpacity: barTrace.opacity
+    readonly property bool resolutionShimmerAnimationRunning: shimmerSweep.running
     readonly property bool barTraceVisible: root.motionVisible && !root.vertical
-        && ((root.serviceState === "loading" && root.loadingMotionReady)
-            || root.timedGapVisible)
+        && ((root.serviceState === "loading" && root.loadingMotionReady
+                && !root.resolutionStatusVisible) || (root.timedGapVisible && !root.countdownVisible))
     readonly property bool finalFailure: ["not_found", "provider_error"].indexOf(root.serviceState) >= 0
+    property real failureOpacity: 1
+    onIsPlayingChanged: {
+        if (!root.isPlaying) {
+            wordSyncTimer.stop()
+            wordSyncFade.stop()
+            wordSyncGlyph.opacity = 0
+            failureDissolve.stop()
+            root.failureOpacity = 1
+            loadingSnapshotFade.stop()
+        }
+    }
+    onFinalFailureChanged: {
+        failureDissolve.stop()
+        if (root.finalFailure && root.motionEnabled && root.isPlaying) {
+            root.failureOpacity = 0
+            failureDissolve.start()
+        } else root.failureOpacity = 1
+    }
+    NumberAnimation {
+        id: failureDissolve
+        target: root
+        property: "failureOpacity"
+        to: 1
+        duration: 200
+        easing.type: Easing.OutCubic
+    }
     readonly property bool popupTraceVisible: root.opened && !root.searchMode
         && ((root.serviceState === "loading" && root.loadingMotionReady)
             || root.timedGapVisible)
@@ -339,6 +496,8 @@ Panel {
             return root.clamp01(Number(root.karaokeService.interludeProgress || 0))
         return 0
     }
+    readonly property bool introBreathingRunning: root.motionEnabled && root.motionVisible
+        && root.isPlaying && root.ready && root.beforeFirstSceneVisible && !root.countdownVisible
     function clamp01(value) {
         var number = Number(value)
         if (!isFinite(number) || number <= 0) return 0
@@ -755,14 +914,15 @@ Panel {
         if (root.failureVisible) return ["primary", "details", "layoutMode"]
         if (root.serviceState !== "ready" || !root.karaokeService) return []
         var ids = ["refresh", "search"]
-        if (root.offsetControlsAvailable) ids.push("earlier", "later", "reset")
-        if (!root.followEnabled) ids.push("follow")
-        ids.push("details")
-        if (root.showDiagnostics) ids.push("clearCache")
-        ids.push("layoutMode")
-        if (root.karaokeService && root.karaokeService.offsetError !== "") ids.push("retry_offset")
-        if (root.forgetVisible) ids.push("forget")
-        else if (root.removeVisible) ids.push("remove")
+        if (root.offsetControlsAvailable) ids.push("earlier", "reset", "later")
+        ids.push("menu")
+        if (root.menuOpen) {
+            ids.push("details", "layoutMode", "clearCache")
+            if (!root.followEnabled) ids.push("follow")
+            if (root.karaokeService.offsetError !== "") ids.push("retry_offset")
+            if (root.forgetVisible) ids.push("forget")
+            else if (root.removeVisible) ids.push("remove")
+        }
         return ids
     }
     function actionLabel(action) {
@@ -770,9 +930,10 @@ Panel {
         case "refresh": return "Refresh"
         case "search": return root.searchMode ? "Search" : "Search"
         case "back": return "Back"
-        case "earlier": return "Earlier"
-        case "later": return "Later"
-        case "reset": return "Reset"
+        case "earlier": return "−"
+        case "later": return "+"
+        case "reset": return root.offsetText
+        case "menu": return "⋯"
         case "follow": return "Follow"
         case "details": return root.showDiagnostics ? "Hide details" : "Details"
         case "layoutMode":
@@ -846,6 +1007,9 @@ Panel {
         case "follow":
             root.followEnabled = true
             root.followCurrent()
+            return
+        case "menu":
+            root.menuOpen = !root.menuOpen
             return
         case "details":
             root.showDiagnostics = !root.showDiagnostics
@@ -1237,21 +1401,170 @@ Panel {
             progress: root.traceProgress
             accentColor: Color.accent
             mutedColor: root.bar ? root.bar.barForeground : Color.bar.text
+            property real breathOpacity: 1
+            opacity: root.pauseSceneVisible ? 0.5 : root.introBreathingRunning ? breathOpacity : 1
+            SequentialAnimation on breathOpacity {
+                id: introBreath
+                running: root.introBreathingRunning
+                loops: Animation.Infinite
+                NumberAnimation { from: 0.4; to: 0.9; duration: 1400; easing.type: Easing.InOutSine }
+                NumberAnimation { from: 0.9; to: 0.4; duration: 1400; easing.type: Easing.InOutSine }
+            }
+        }
+        Row {
+            id: countdownRow
+            anchors.centerIn: parent
+            width: Math.min(root.configuredWidth - Style.spacing.md * 2, 360)
+            spacing: Style.spacing.sm
+            visible: root.countdownVisible
+            opacity: root.pauseSceneVisible ? 0.5 : 1
+            Text {
+                id: countdownText
+                text: root.countdownDots
+                textFormat: Text.PlainText
+                color: Color.accent
+                font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                font.pixelSize: Style.font.body
+                anchors.verticalCenter: parent.verticalCenter
+            }
+            KaraokeLine {
+                id: previewLine
+                width: Math.max(0, countdownRow.width - countdownText.implicitWidth - countdownRow.spacing)
+                height: root.barSize
+                line: root.countdownVisible && root.karaokeService ? root.karaokeService.nextLine : null
+                position: line ? line.start : 0
+                playing: false
+                wordTiming: false
+                foreground: Color.muted
+                accent: Color.accent
+                fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
+                fontSize: Style.font.body
+                anchors.verticalCenter: parent.verticalCenter
+            }
+        }
+
+        Text {
+            id: pauseMark
+            anchors.left: parent.left
+            anchors.leftMargin: 2
+            anchors.verticalCenter: parent.verticalCenter
+            visible: root.pauseSceneVisible
+            text: "⏸"
+            textFormat: Text.PlainText
+            color: root.bar ? root.bar.barForeground : Color.bar.text
+            opacity: 0.5
+            font.family: root.bar ? root.bar.fontFamily : Style.font.family
+            font.pixelSize: Style.font.caption
+        }
+
+        Text {
+            anchors.centerIn: parent
+            visible: root.ready && !root.vertical && root.projectionState === "after_last"
+                && root.karaokeService && root.karaokeService.afterLastElapsed < 0.25
+            opacity: !root.karaokeService ? 0 : root.pauseSceneVisible ? 0.5
+                : 1 - Math.min(1, root.karaokeService.afterLastElapsed / 0.25)
+            text: root.lastVisibleLineText
+            textFormat: Text.PlainText
+            color: root.bar ? root.bar.barForeground : Color.bar.text
+            font.family: root.bar ? root.bar.fontFamily : Style.font.family
+            font.pixelSize: Style.font.body
+            elide: Text.ElideRight
+            width: Math.max(0, root.configuredWidth - Style.spacing.md * 2)
+            horizontalAlignment: Text.AlignHCenter
+        }
+        Rectangle {
+            anchors.centerIn: parent
+            width: 22
+            height: 22
+            radius: 11
+            color: Color.accent
+            visible: root.ready && !root.vertical && root.projectionState === "after_last"
+                && root.karaokeService && root.karaokeService.afterLastElapsed < 2.5
+            opacity: !root.karaokeService ? 0 : root.pauseSceneVisible ? 0.25
+                : 0.4 * (1 - Math.min(1, root.karaokeService.afterLastElapsed / 2.5))
         }
 
         Text {
             id: glyphText
             anchors.centerIn: parent
-            visible: root.vertical || root.finalFailure
+            visible: root.vertical
+                || (root.finalFailure && !root.resolutionStatusVisible)
                 || (root.ready && root.projectionState === "before_first"
                     && !root.beforeFirstSceneVisible)
-                || (root.ready && root.projectionState === "after_last")
+                || (root.ready && root.projectionState === "after_last"
+                    && root.karaokeService && root.karaokeService.afterLastElapsed >= 2.5)
             textFormat: Text.PlainText
             text: root.verticalGlyph
-            color: root.finalFailure ? Color.muted
+            color: root.finalFailure ? root.barSecondaryForeground
                 : (root.bar ? root.bar.barForeground : Color.bar.text)
             font.family: root.bar ? root.bar.fontFamily : Style.font.family
             font.pixelSize: Style.font.body
+            opacity: root.finalFailure ? root.failureOpacity
+                : (root.pauseSceneVisible ? 0.5 : 1)
+        }
+        Text {
+            anchors.left: glyphText.right
+            anchors.leftMargin: Style.spacing.sm
+            anchors.verticalCenter: glyphText.verticalCenter
+            visible: root.finalFailure && !root.resolutionStatusVisible && !root.vertical
+            text: root.karaokeService && root.karaokeService.resolutionPhrase !== ""
+                ? root.karaokeService.resolutionPhrase : root.failureMessage
+            textFormat: Text.PlainText
+            color: root.barSecondaryForeground
+            font.family: root.bar ? root.bar.fontFamily : Style.font.family
+            font.pixelSize: Style.font.caption
+            elide: Text.ElideRight
+            width: Math.max(0, root.configuredWidth - glyphText.width - Style.spacing.md * 2)
+            opacity: root.failureOpacity
+        }
+
+        Text {
+            id: resolutionBarText
+            anchors.centerIn: parent
+            width: Math.max(0, root.configuredWidth - Style.spacing.md * 2)
+            visible: root.resolutionStatusVisible && !root.vertical
+            textFormat: Text.PlainText
+            text: root.resolutionPhrase
+            color: root.bar ? root.bar.barForeground : Color.bar.text
+            font.family: root.bar ? root.bar.fontFamily : Style.font.family
+            font.pixelSize: Style.font.body
+            horizontalAlignment: Text.AlignHCenter
+            elide: Text.ElideRight
+        }
+        Item {
+            anchors.fill: resolutionBarText
+            visible: root.resolutionShimmerRunning
+            clip: true
+            Item {
+                id: shimmerWindow
+                width: 48
+                height: parent.height
+                clip: true
+                Text {
+                    x: -shimmerWindow.x
+                    width: resolutionBarText.width
+                    height: resolutionBarText.height
+                    textFormat: Text.PlainText
+                    text: resolutionBarText.text
+                    color: Color.accent
+                    opacity: 0.5
+                    font: resolutionBarText.font
+                    horizontalAlignment: Text.AlignHCenter
+                    elide: Text.ElideRight
+                }
+                SequentialAnimation on x {
+                    id: shimmerSweep
+                    running: root.resolutionShimmerRunning
+                    loops: Animation.Infinite
+                    NumberAnimation {
+                        from: -48
+                        to: resolutionBarText.width
+                        duration: 2200
+                        easing.type: Easing.InOutSine
+                    }
+                    PauseAnimation { duration: 550 }
+                }
+            }
         }
 
         Text {
@@ -1268,20 +1581,39 @@ Panel {
             horizontalAlignment: Text.AlignHCenter
         }
 
+        Text {
+            id: wordSyncGlyph
+            anchors.left: parent.left
+            anchors.leftMargin: 2
+            anchors.verticalCenter: parent.verticalCenter
+            textFormat: Text.PlainText
+            text: "◆"
+            color: Color.accent
+            font.family: root.bar ? root.bar.fontFamily : Style.font.family
+            font.pixelSize: Style.font.caption
+            opacity: 0
+            visible: lineItem.visible && root.karaokeService
+                && root.karaokeService.timing === "word" && opacity > 0
+        }
+
         KaraokeLine {
             id: lineItem
             visible: !root.vertical && root.ready && root.projectionState === "line"
                 && root.karaokeService && !!root.karaokeService.currentLine
             anchors.fill: parent
-            anchors.leftMargin: Style.spacing.md
+            // The pause and Word Sync marks live in this left gutter, so
+            // they never paint over the first letter.
+            anchors.leftMargin: Math.max(Style.spacing.md,
+                2 + Math.max(pauseMark.implicitWidth, wordSyncGlyph.implicitWidth) + Style.space(3))
             anchors.rightMargin: Style.spacing.md
-            opacity: root.isPlaying ? 1 : 0.72
+            opacity: root.isPlaying ? 1 : 0.5
             line: root.karaokeService ? root.karaokeService.currentLine : null
             position: root.karaokeService && typeof root.karaokeService.position === "number"
                 ? root.karaokeService.position : 0
             wordTiming: root.karaokeService ? root.karaokeService.timing === "word" : false
             playing: root.isPlaying
             foreground: root.bar ? root.bar.barForeground : Color.bar.text
+            accent: Color.accent
             muted: Color.muted
             fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
             fontSize: Style.font.body
@@ -1318,9 +1650,7 @@ Panel {
     onServiceStateChanged: {
         button.hideOwnTooltip()
         loadingRevealTimer.stop()
-        loadingLabelTimer.stop()
         root.loadingMotionReady = false
-        root.loadingLabelReady = false
         if (serviceState === "idle") root.close()
         if (serviceState === "loading") {
             // Keep the outgoing lyric briefly while loading starts. A quick
@@ -1338,9 +1668,9 @@ Panel {
             loadingSnapshotItem.opacity = root.loadingSnapshotText !== "" ? 1 : 0
             if (root.loadingSnapshotText !== "") loadingSnapshotFade.start()
             loadingRevealTimer.restart()
-            loadingLabelTimer.restart()
             root.searchMode = false
             root.showDiagnostics = false
+            root.menuOpen = false
             root.cursorActive = false
             root.offsetWritePending = false
             root.offsetFlashVisible = false
@@ -1359,6 +1689,7 @@ Panel {
     onKaraokeServiceChanged: root.deferredPushSettings()
     onSettingsChanged: root.pushSettings()
     onSearchModeChanged: {
+        root.menuOpen = false
         if (root.searchMode) {
             if (root.searchSeedKey !== root.trackSeedKey()) root.seedQueryDrafts()
             root.focusSection = "query"
@@ -1390,14 +1721,6 @@ Panel {
         }
     }
 
-    Timer {
-        id: loadingLabelTimer
-        interval: 700
-        repeat: false
-        onTriggered: {
-            if (root.serviceState === "loading") root.loadingLabelReady = true
-        }
-    }
 
     Timer {
         id: handoffReleaseTimer
@@ -1443,6 +1766,42 @@ Panel {
         }
     }
 
+    component PanelAction: Item {
+        id: actionItem
+        required property string action
+        readonly property int actionIndex: root.actionIds().indexOf(action)
+        readonly property bool selected: root.cursorActive && root.focusSection === "actions"
+            && root.selectedIndex === actionIndex
+        implicitWidth: action === "refresh" ? 64 : action === "search" ? 58
+            : action === "earlier" || action === "later" ? 28
+            : action === "reset" ? 76 : action === "menu" ? 32
+            : actionButton.implicitWidth + Style.space(8)
+        implicitHeight: actionButton.implicitHeight
+        width: implicitWidth
+        height: implicitHeight
+        Rectangle {
+            anchors.fill: parent
+            radius: Style.space(4)
+            color: Qt.rgba(root.panelForeground.r, root.panelForeground.g,
+                root.panelForeground.b, actionItem.selected ? 0.16 : 0.06)
+            border.color: actionItem.selected ? Color.accent
+                : Qt.rgba(root.panelForeground.r, root.panelForeground.g,
+                    root.panelForeground.b, 0.34)
+            border.width: 1
+        }
+        Button {
+            id: actionButton
+            anchors.fill: parent
+            text: root.actionLabel(actionItem.action)
+            enabled: root.actionEnabled(actionItem.action)
+            hasCursor: actionItem.selected
+            onClicked: root.activateAction(actionItem.action)
+            onHovered: function(isHovered) {
+                if (isHovered) root.setCursor("actions", actionItem.actionIndex)
+            }
+        }
+    }
+
     KeyboardPanel {
         id: popup
         anchorItem: button
@@ -1481,6 +1840,7 @@ Panel {
                         // is now the working lyrics.
                         root.searchMode = false
                         root.showDiagnostics = false
+                        root.menuOpen = false
                         if (root.followEnabled && root.serviceState === "ready") root.resetPanelCursor()
                         else root.clampSelectedIndex()
                     }
@@ -1518,7 +1878,7 @@ Panel {
                     meta: root.artistName
                     detail: root.panelTiming
                     foreground: root.panelForeground
-                    fontFamily: root.panelFont
+                    fontFamily: Style.font.family
                     iconComponent: Component {
                         Item {
                             width: Style.font.display
@@ -1542,35 +1902,44 @@ Panel {
                     }
                 }
 
-                Column {
+                // Keep metadata out of the hero; the provenance lives in Details.
+                Item {
                     width: parent.width
-                    spacing: Style.space(2)
+                    height: 26
                     visible: root.serviceState === "ready" && !root.searchMode
-                    Text {
+                    Rectangle {
+                        anchors.bottom: parent.bottom
                         width: parent.width
-                        textFormat: Text.PlainText
-                        text: root.matchedText
-                        visible: root.matchedText !== ""
-                        color: Color.muted
-                        font.family: root.panelFont
-                        font.pixelSize: Style.font.caption
-                        elide: Text.ElideRight
+                        height: 3
+                        radius: 2
+                        color: root.secondaryForeground
+                        opacity: 0.35
+                    }
+                    Rectangle {
+                        anchors.bottom: parent.bottom
+                        width: parent.width * Math.max(0, Math.min(1,
+                            root.duration() > 0 && root.karaokeService
+                                ? root.karaokeService.position / root.duration() : 0))
+                        height: 3
+                        radius: 2
+                        color: Color.accent
                     }
                     Text {
-                        width: parent.width
-                        textFormat: Text.PlainText
-                        text: "Community lyrics · personal display only"
-                        visible: root.sharedNoticeVisible
-                        color: Color.muted
-                        font.family: root.panelFont
-                        font.pixelSize: Style.font.caption
-                    }
-                    Text {
+                        anchors.left: parent.left
+                        anchors.top: parent.top
                         textFormat: Text.PlainText
                         text: root.karaokeService
-                            ? KaraokeModel.formatTime(root.karaokeService.position) + " / "
-                                + KaraokeModel.formatTime(root.duration()) : "--:-- / --:--"
-                        color: Color.muted
+                            ? KaraokeModel.formatTime(root.karaokeService.position) : "--:--"
+                        color: root.secondaryForeground
+                        font.family: root.panelFont
+                        font.pixelSize: Style.font.caption
+                    }
+                    Text {
+                        anchors.right: parent.right
+                        anchors.top: parent.top
+                        textFormat: Text.PlainText
+                        text: KaraokeModel.formatTime(root.duration())
+                        color: root.secondaryForeground
                         font.family: root.panelFont
                         font.pixelSize: Style.font.caption
                     }
@@ -1580,19 +1949,39 @@ Panel {
                     id: statusText
                     width: parent.width
                     textFormat: Text.PlainText
-                    color: Color.muted
+                    color: root.secondaryForeground
                     font.family: root.panelFont
                     font.pixelSize: Style.font.body
-                    visible: root.serviceState === "loading" && root.loadingLabelReady && !root.searchMode
+                    visible: root.serviceState === "loading" && root.resolutionStatusVisible
                     horizontalAlignment: Text.AlignHCenter
-                    text: "Loading synchronized lyrics…"
+                    text: root.resolutionPhrase
+                }
+
+                Column {
+                    width: parent.width
+                    spacing: Style.space(4)
+                    visible: root.serviceState === "loading" && root.resolutionStatusVisible
+                        && root.resolutionTimeline.length > 0
+                    Repeater {
+                        model: root.resolutionTimeline
+                        delegate: Text {
+                            required property var modelData
+                            width: parent.width
+                            textFormat: Text.PlainText
+                            text: root.resolutionStepText(modelData)
+                            color: modelData.outcome === "found" ? root.panelForeground : root.secondaryForeground
+                            font.family: root.panelFont
+                            font.pixelSize: Style.font.caption
+                            horizontalAlignment: Text.AlignHCenter
+                            elide: Text.ElideRight
+                        }
+                    }
                 }
 
                 Column {
                     width: parent.width
                     spacing: Style.space(4)
                     visible: root.popupLoadingSnapshotVisible
-                    opacity: loadingSnapshotItem.opacity
                     Text {
                         width: parent.width
                         textFormat: Text.PlainText
@@ -1609,7 +1998,7 @@ Panel {
                         textFormat: Text.PlainText
                         text: root.loadingSnapshotArtist
                         visible: text !== ""
-                        color: Color.muted
+                        color: root.secondaryForeground
                         font.family: root.panelFont
                         font.pixelSize: Style.font.caption
                         horizontalAlignment: Text.AlignHCenter
@@ -1619,7 +2008,7 @@ Panel {
                         width: parent.width
                         textFormat: Text.PlainText
                         text: root.loadingSnapshotText
-                        color: Color.muted
+                        color: root.secondaryForeground
                         font.family: root.panelFont
                         font.pixelSize: Style.font.body
                         horizontalAlignment: Text.AlignHCenter
@@ -1627,16 +2016,32 @@ Panel {
                     }
                 }
 
-                ProgressTrace {
-                    id: popupTrace
-                    width: Math.min(parent.width, 176)
-                    x: (parent.width - width) / 2
-                    visible: root.popupTraceVisible
-                    busy: root.serviceState === "loading"
-                    busyPhase: root.motionEnabled ? root.loadingPhase : 0.5
-                    progress: root.traceProgress
-                    accentColor: Color.accent
-                    mutedColor: Color.muted
+                Item {
+                    id: traceSlot
+                    width: parent.width
+                    height: 10
+                    visible: root.serviceState !== "idle" && !root.searchMode
+                    ProgressTrace {
+                        id: popupTrace
+                        width: Math.min(parent.width, 176)
+                        x: (parent.width - width) / 2
+                        visible: root.popupTraceVisible
+                        busy: root.serviceState === "loading"
+                        busyPhase: root.motionEnabled ? root.loadingPhase : 0.5
+                        progress: root.traceProgress
+                        accentColor: Color.accent
+                        mutedColor: root.secondaryForeground
+                    }
+                }
+                Text {
+                    width: parent.width
+                    visible: root.opened && root.countdownStep > 0 && !root.searchMode
+                    textFormat: Text.PlainText
+                    text: root.countdownDots
+                    color: Color.accent
+                    font.family: root.panelFont
+                    font.pixelSize: Style.font.caption
+                    horizontalAlignment: Text.AlignHCenter
                 }
 
                 // One centered failure composition: glyph, literal message, and
@@ -1645,14 +2050,15 @@ Panel {
                     id: failureBlock
                     width: parent.width
                     spacing: Style.space(8)
-                    visible: root.failureVisible
+                    visible: root.failureVisible && !(root.karaokeService
+                        && root.karaokeService.autoRetryPending)
                     opacity: visible ? 1 : 0
                     Text {
                         id: failureGlyph
                         width: parent.width
                         textFormat: Text.PlainText
                         text: root.musicGlyph
-                        color: Color.muted
+                        color: root.secondaryForeground
                         font.family: root.panelFont
                         font.pixelSize: Style.font.display
                         horizontalAlignment: Text.AlignHCenter
@@ -1664,6 +2070,18 @@ Panel {
                         color: root.panelForeground
                         font.family: root.panelFont
                         font.pixelSize: Style.font.body
+                        horizontalAlignment: Text.AlignHCenter
+                        wrapMode: Text.Wrap
+                    }
+                    Text {
+                        id: failureSummary
+                        width: parent.width
+                        visible: root.failureProviderSummary !== ""
+                        textFormat: Text.PlainText
+                        text: root.failureProviderSummary
+                        color: root.secondaryForeground
+                        font.family: root.panelFont
+                        font.pixelSize: Style.font.caption
                         horizontalAlignment: Text.AlignHCenter
                         wrapMode: Text.Wrap
                     }
@@ -1707,7 +2125,7 @@ Panel {
                             width: parent.width
                             textFormat: Text.PlainText
                             text: root.diagnosticText()
-                            color: Color.muted
+                            color: root.secondaryForeground
                             font.family: root.panelFont
                             font.pixelSize: Style.font.caption
                             wrapMode: Text.Wrap
@@ -1717,7 +2135,7 @@ Panel {
                             textFormat: Text.PlainText
                             text: root.providerAttemptsText
                             visible: root.providerAttemptsText !== ""
-                            color: Color.muted
+                            color: root.secondaryForeground
                             font.family: root.panelFont
                             font.pixelSize: Style.font.caption
                             wrapMode: Text.Wrap
@@ -1736,36 +2154,65 @@ Panel {
                     textFormat: Text.PlainText
                     text: root.privacyWarning
                     visible: root.privacyWarning !== ""
-                    color: Color.muted
+                    color: root.secondaryForeground
                     font.family: root.panelFont
                     font.pixelSize: Style.font.caption
                     wrapMode: Text.Wrap
                 }
 
-                // Visible actions sit before the long lyric list so the full
-                // action area stays inside the panel height.
-                Flow {
+                // Three compact groups remain on one row even at the 320px bar size.
+                Row {
                     id: readyActions
-                    width: parent.width
-                    spacing: Style.space(6)
+                    anchors.horizontalCenter: parent.horizontalCenter
+                    spacing: Style.space(4)
                     visible: root.serviceState === "ready" && !root.searchMode
-                    Repeater {
-                        model: root.serviceState === "ready" && !root.searchMode ? root.actionIds() : []
-                        Button {
-                            required property string modelData
-                            required property int index
-                            text: root.actionLabel(modelData)
-                            enabled: root.actionEnabled(modelData)
-                            hasCursor: root.cursorActive && root.focusSection === "actions"
-                                && root.selectedIndex === index
-                            visible: {
-                                if (modelData === "follow") return !root.followEnabled
-                                return true
-                            }
-                            onClicked: root.activateAction(modelData)
-                            onHovered: function(isHovered) { if (isHovered) root.setCursor("actions", index) }
-                    }
+                    PanelAction { action: "refresh" }
+                    PanelAction { action: "search" }
+                    Item { width: Style.space(2); height: 1 }
+                    PanelAction { action: "earlier"; visible: root.offsetControlsAvailable; width: visible ? implicitWidth : 0 }
+                    PanelAction { action: "reset"; visible: root.offsetControlsAvailable; width: visible ? implicitWidth : 0 }
+                    PanelAction { action: "later"; visible: root.offsetControlsAvailable; width: visible ? implicitWidth : 0 }
+                    Item { width: Style.space(2); height: 1 }
+                    PanelAction { action: "menu" }
                 }
+                // The ⋯ menu floats over the lyric list under its button, so
+                // opening it never moves the list. A fixed 1 px anchor keeps
+                // the column layout identical whether it is open or closed
+                // (Column does not lay out or show zero-height children).
+                Item {
+                    id: menuAnchor
+                    width: parent.width
+                    height: 1
+                    z: 2
+                    visible: root.serviceState === "ready" && !root.searchMode
+                    Rectangle {
+                        id: menuCard
+                        visible: root.menuOpen
+                        x: Math.max(0, readyActions.x + readyActions.width - width)
+                        y: -Style.space(2) - 1
+                        width: Math.min(parent.width, Math.max(menuColumn.implicitWidth, 160) + Style.space(12))
+                        height: menuColumn.implicitHeight + Style.space(12)
+                        radius: Style.space(6)
+                        color: Qt.rgba(Color.popups.background.r, Color.popups.background.g,
+                            Color.popups.background.b, 1)
+                        border.width: 1
+                        border.color: Qt.rgba(root.panelForeground.r, root.panelForeground.g,
+                            root.panelForeground.b, 0.34)
+                        Column {
+                            id: menuColumn
+                            anchors.centerIn: parent
+                            spacing: Style.space(4)
+                            Repeater {
+                                model: root.serviceState === "ready" && root.menuOpen && !root.searchMode
+                                    ? root.actionIds().slice(root.actionIds().indexOf("menu") + 1) : []
+                                PanelAction {
+                                    required property string modelData
+                                    action: modelData
+                                    width: menuCard.width - Style.space(12)
+                                }
+                            }
+                        }
+                    }
                 }
 
                 // Failed forget/remove while ready: actionable copy above the
@@ -1797,10 +2244,30 @@ Panel {
                     spacing: Style.space(4)
                     visible: root.showDiagnostics && root.serviceState === "ready" && !root.searchMode
                     Text {
+                        id: matchedDetail
+                        width: parent.width
+                        visible: root.matchedText !== ""
+                        textFormat: Text.PlainText
+                        text: root.matchedText
+                        color: root.secondaryForeground
+                        font.family: Style.font.family
+                        font.pixelSize: Style.font.caption
+                        wrapMode: Text.Wrap
+                    }
+                    Text {
+                        width: parent.width
+                        visible: root.sharedNoticeVisible
+                        textFormat: Text.PlainText
+                        text: "Community lyrics · personal display only"
+                        color: root.secondaryForeground
+                        font.family: Style.font.family
+                        font.pixelSize: Style.font.caption
+                    }
+                    Text {
                         width: parent.width
                         textFormat: Text.PlainText
                         text: root.diagnosticText()
-                        color: Color.muted
+                        color: root.secondaryForeground
                         font.family: root.panelFont
                         font.pixelSize: Style.font.caption
                         wrapMode: Text.Wrap
@@ -1810,7 +2277,7 @@ Panel {
                         textFormat: Text.PlainText
                         text: root.providerAttemptsText
                         visible: root.providerAttemptsText !== ""
-                        color: Color.muted
+                        color: root.secondaryForeground
                         font.family: root.panelFont
                         font.pixelSize: Style.font.caption
                         wrapMode: Text.Wrap
@@ -1826,11 +2293,38 @@ Panel {
                 ListView {
                     id: lyricList
                     width: parent.width
-                    height: Math.min(220, contentHeight)
+                    height: Math.max(Math.min(220, contentHeight), root.menuOpen ? menuCard.height : 0)
                     visible: root.serviceState === "ready" && !root.searchMode
                     clip: true
                     model: root.karaokeService ? root.karaokeService.lines : []
                     spacing: Style.space(7)
+                    // Edge fades: a row cut by the list edge (e.g. the
+                    // previous line's timestamp under the actions) fades out
+                    // instead of showing as a stray fragment.
+                    Rectangle {
+                        parent: lyricList
+                        z: 1
+                        anchors { left: parent.left; right: parent.right; top: parent.top }
+                        height: Style.space(18)
+                        visible: !lyricList.atYBeginning
+                        gradient: Gradient {
+                            GradientStop { position: 0; color: Color.popups.background }
+                            GradientStop { position: 1; color: Qt.rgba(Color.popups.background.r,
+                                Color.popups.background.g, Color.popups.background.b, 0) }
+                        }
+                    }
+                    Rectangle {
+                        parent: lyricList
+                        z: 1
+                        anchors { left: parent.left; right: parent.right; bottom: parent.bottom }
+                        height: Style.space(18)
+                        visible: !lyricList.atYEnd
+                        gradient: Gradient {
+                            GradientStop { position: 0; color: Qt.rgba(Color.popups.background.r,
+                                Color.popups.background.g, Color.popups.background.b, 0) }
+                            GradientStop { position: 1; color: Color.popups.background }
+                        }
+                    }
                     boundsBehavior: Flickable.StopAtBounds
                     onMovementStarted: {
                         if (!root.autoFollowing) root.followEnabled = false
@@ -1842,6 +2336,7 @@ Panel {
                         id: rowItem
                         required property var modelData
                         required property int index
+                        readonly property var activePaintText: currentRenderer.paintedText
                         width: lyricList.width
                         height: rowColumn.implicitHeight
 
@@ -1864,8 +2359,8 @@ Panel {
                                 visible: rowItem.index !== root.karaokeService.activeLineIndex
                                 textFormat: Text.PlainText
                                 text: rowItem.modelData.text || ""
-                                color: Color.muted
-                                font.family: root.panelFont
+                                color: root.secondaryForeground
+                                font.family: Style.font.family
                                 font.pixelSize: Style.font.body
                                 horizontalAlignment: Text.AlignHCenter
                                 wrapMode: Text.Wrap
@@ -1879,15 +2374,18 @@ Panel {
                                 KaraokeLine {
                                     id: currentRenderer
                                     anchors.fill: parent
-                                    line: rowItem.modelData
+                                    segmentEnabled: false
+                                    wrapEnabled: true
+                                    line: root.karaokeService && root.karaokeService.lines
+                                        ? root.karaokeService.lines[rowItem.index] : rowItem.modelData
                                     position: root.karaokeService
                                         && typeof root.karaokeService.position === "number"
                                         ? root.karaokeService.position : 0
                                     wordTiming: root.karaokeService.timing === "word"
                                     playing: root.isPlaying
-                                    foreground: Color.accent
-                                    muted: Color.muted
-                                    fontFamily: root.panelFont
+                                    foreground: root.panelForeground
+                                    muted: root.secondaryForeground
+                                    fontFamily: Style.font.family
                                     fontSize: Style.font.body
                                 }
                             }
@@ -1898,8 +2396,8 @@ Panel {
                                     && String(rowItem.modelData.translation || "") !== ""
                                 textFormat: Text.PlainText
                                 text: rowItem.modelData ? String(rowItem.modelData.translation || "") : ""
-                                color: Color.muted
-                                font.family: root.panelFont
+                                color: root.secondaryForeground
+                                font.family: Style.font.family
                                 font.pixelSize: Style.font.caption
                                 horizontalAlignment: Text.AlignHCenter
                                 wrapMode: Text.Wrap
@@ -1909,7 +2407,7 @@ Panel {
                                 width: parent.width
                                 textFormat: Text.PlainText
                                 text: KaraokeModel.formatTime(Number(rowItem.modelData.start))
-                                color: Color.muted
+                                color: root.secondaryForeground
                                 font.family: root.panelFont
                                 font.pixelSize: Style.font.caption
                                 horizontalAlignment: Text.AlignHCenter
@@ -1930,7 +2428,7 @@ Panel {
                     textFormat: Text.PlainText
                     text: root.seekHint
                     visible: root.serviceState === "ready" && !root.searchMode && root.seekHint !== ""
-                    color: Color.muted
+                    color: root.secondaryForeground
                     font.family: root.panelFont
                     font.pixelSize: Style.font.caption
                     horizontalAlignment: Text.AlignHCenter
@@ -1943,18 +2441,7 @@ Panel {
                     width: parent.width
                     spacing: Style.space(4)
                     visible: root.serviceState === "ready" && !root.searchMode
-                    Row {
-                        anchors.horizontalCenter: parent.horizontalCenter
-                        spacing: Style.space(8)
-                        Text {
-                            textFormat: Text.PlainText
-                            text: root.offsetText
-                            color: root.panelForeground
-                            font.family: root.panelFont
-                            font.pixelSize: Style.font.body
-                            anchors.verticalCenter: parent.verticalCenter
-                        }
-                    }
+                    // The offset value is the reset button in the action stepper.
                     Text {
                         width: parent.width
                         textFormat: Text.PlainText
@@ -1970,7 +2457,7 @@ Panel {
                         textFormat: Text.PlainText
                         text: root.karaokeService ? root.failureCopy(root.karaokeService.offsetError).message : ""
                         visible: root.karaokeService && root.karaokeService.offsetError !== ""
-                        color: Color.muted
+                        color: root.secondaryForeground
                         font.family: root.panelFont
                         font.pixelSize: Style.font.caption
                         horizontalAlignment: Text.AlignHCenter
@@ -1981,7 +2468,7 @@ Panel {
                         textFormat: Text.PlainText
                         text: root.offsetDisabledHint
                         visible: !root.offsetControlsAvailable
-                        color: Color.muted
+                        color: root.secondaryForeground
                         font.family: root.panelFont
                         font.pixelSize: Style.font.caption
                         horizontalAlignment: Text.AlignHCenter
@@ -2111,7 +2598,7 @@ Panel {
                         textFormat: Text.PlainText
                         text: root.searchSupportHint
                         visible: root.searchSupportHint !== ""
-                        color: Color.muted
+                        color: root.secondaryForeground
                         font.family: root.panelFont
                         font.pixelSize: Style.font.caption
                         wrapMode: Text.Wrap
@@ -2121,7 +2608,7 @@ Panel {
                         textFormat: Text.PlainText
                         text: root.searchOfflineHint
                         visible: root.searchOfflineHint !== ""
-                        color: Color.muted
+                        color: root.secondaryForeground
                         font.family: root.panelFont
                         font.pixelSize: Style.font.caption
                         wrapMode: Text.Wrap
@@ -2149,7 +2636,7 @@ Panel {
                         textFormat: Text.PlainText
                         text: "Searching…"
                         visible: root.karaokeService && root.karaokeService.searchState === "loading"
-                        color: Color.muted
+                        color: root.secondaryForeground
                         font.family: root.panelFont
                         font.pixelSize: Style.font.body
                         horizontalAlignment: Text.AlignHCenter
@@ -2216,7 +2703,7 @@ Panel {
                                     width: parent.width
                                     textFormat: Text.PlainText
                                     text: root.resultMetaText(resultItem.modelData)
-                                    color: Color.muted
+                                    color: root.secondaryForeground
                                     font.family: root.panelFont
                                     font.pixelSize: Style.font.caption
                                     elide: Text.ElideRight
