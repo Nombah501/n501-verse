@@ -31,10 +31,11 @@ class LyricsDocumentAdapter:
         duration_s: float | None = None,
         origin: LyricsOrigin = LyricsOrigin.NETWORK,
         cache_state: LyricsCacheState = LyricsCacheState.NONE,
+        timing: TimingKind | None = None,
     ) -> LyricsDocument:
         """Build and validate one immutable source-neutral lyric document."""
         normalized_lines = tuple(lines)
-        timing = (
+        timing = timing or (
             TimingKind.WORD
             if any(line.has_word_timing for line in normalized_lines)
             else TimingKind.LINE

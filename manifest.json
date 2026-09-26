@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "n501.karaoke",
   "name": "N501 Verse: Word-Synced Lyrics",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "author": "n501",
   "description": "Word-by-word karaoke lyrics right in your Omarchy bar. Finds synced lyrics automatically — local .lrc, NetEase, LRCLIB, Kugou — works with any MPRIS player, and recolors itself with every theme.",
   "license": "MIT",
@@ -24,6 +24,7 @@
       "lrclibEnabled": true,
       "kugouEnabled": true,
       "showTranslations": "On",
+      "lyricsSize": "Normal",
       "motionEnabled": true
     },
     "schema": [
@@ -71,6 +72,14 @@
         "options": ["On", "Off"],
         "description": "Show translated lyric lines when the provider supplies them.",
         "defaultValue": "On"
+      },
+      {
+        "key": "lyricsSize",
+        "type": "enum",
+        "label": "Lyrics size",
+        "options": ["Small", "Normal", "Large"],
+        "description": "Size of lyric and translation lines in the panel; the bar is unchanged.",
+        "defaultValue": "Normal"
       },
       {
         "key": "motionEnabled",

@@ -12,6 +12,8 @@ class TimingKind(StrEnum):
 
     LINE = "Line"
     WORD = "Word"
+    UNSYNCED = "Unsynced"
+    INSTRUMENTAL = "Instrumental"
 
 
 class LyricsOrigin(StrEnum):
@@ -54,6 +56,7 @@ class LyricLine:
     text: str
     translation: str
     words: tuple[LyricWord, ...] = ()
+    timing: TimingKind = TimingKind.LINE
 
     @property
     def has_word_timing(self) -> bool:
@@ -96,6 +99,13 @@ def validate_document(document: LyricsDocument) -> None:
         not math.isfinite(document.duration_s) or document.duration_s <= 0.0
     ):
         raise ValueError("lyrics document has an invalid duration")
+    if document.timing is TimingKind.UNSYNCED and (
+        not document.lines or any(line.start != 0 or line.end != 0 or line.words
+                                  for line in document.lines)
+    ):
+        raise ValueError("unsynced document contains timed spans")
+    if document.timing is TimingKind.INSTRUMENTAL and document.lines:
+        raise ValueError("instrumental document contains lyrics")
 
     previous_start = -math.inf
     for line in document.lines:

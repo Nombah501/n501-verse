@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .match import Candidate, MatchConfidence
+from .models import TimingKind
 from .models import LyricLine
 
 
@@ -19,6 +20,7 @@ class LyricsArtifact:
     payload: dict[str, str]
     lines: tuple[LyricLine, ...]
     confidence: MatchConfidence
+    timing: TimingKind | None = None
 
     @property
     def candidate(self) -> Candidate:

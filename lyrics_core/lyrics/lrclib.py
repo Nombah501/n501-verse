@@ -12,9 +12,9 @@ from ..async_task import create_owned_task
 from .artifact import LyricsArtifact
 from .artist_grammar import primary_artist
 from .http import LyricsHttpError, LyricsSession, LyricsTimeout
-from .lrc_parser import parse_lrc
+from .lrc_parser import MAX_LINES, parse_lrc
 from .match import Candidate, MatchEvidence, TrackMetadata, best_match, evaluate_match, query_variants
-from .models import LyricLine
+from .models import LyricLine, TimingKind
 from .payload import read_json_capped
 from .search_policy import MANUAL_SEARCH_RESULTS_PER_PROVIDER
 from .title_grammar import base_title
@@ -37,6 +37,8 @@ class Record:
     album: str
     duration_s: float | None
     synced_lyrics: str
+    plain_lyrics: str = ""
+    instrumental: bool = False
 
 
 def _record(data: object) -> Record | None:
@@ -46,7 +48,11 @@ def _record(data: object) -> Record | None:
     if song_id is None:
         return None
     synced = data.get("syncedLyrics")
-    if not isinstance(synced, str) or not synced.strip():
+    plain = data.get("plainLyrics")
+    synced = synced if isinstance(synced, str) else ""
+    plain = plain if isinstance(plain, str) else ""
+    instrumental = data.get("instrumental") is True
+    if not synced.strip() and not plain.strip() and not instrumental:
         return None
     duration = data.get("duration")
     return Record(
@@ -56,6 +62,8 @@ def _record(data: object) -> Record | None:
         album=str(data.get("albumName", "")),
         duration_s=float(duration) if isinstance(duration, (int, float)) else None,
         synced_lyrics=synced,
+        plain_lyrics=plain,
+        instrumental=instrumental,
     )
 
 
@@ -90,15 +98,27 @@ async def search_records(session: LyricsSession, track: TrackMetadata) -> list[R
 
 
 def parse_payload(payload: Mapping[str, str]) -> tuple[LyricLine, ...]:
-    return tuple(parse_lrc(payload.get("syncedLyrics", "")))
+    synced = tuple(parse_lrc(payload.get("syncedLyrics", "")))
+    if synced:
+        return synced
+    plain = payload.get("plainLyrics", "")
+    if not isinstance(plain, str):
+        return ()
+    return tuple(LyricLine(index, f"plain-{index}", 0.0, 0.0, text.strip(), "")
+                 for index, text in enumerate(line for line in plain.splitlines() if line.strip())
+                 if index < MAX_LINES)
 
 
 async def search_artifacts(
     session: LyricsSession,
     track: TrackMetadata,
+    *,
+    song_id: str | None = None,
 ) -> tuple[LyricsArtifact, ...]:
-    """Return several selectable LRCLIB lyric artifacts for manual search."""
-    records = (await search_records(session, track))[:MANUAL_SEARCH_RESULTS_PER_PROVIDER]
+    """Return selectable LRCLIB artifacts, or a saved song from all search rows."""
+    records = await search_records(session, track)
+    records = ([record for record in records if record.song_id == song_id]
+               if song_id is not None else records[:MANUAL_SEARCH_RESULTS_PER_PROVIDER])
     artifacts: list[LyricsArtifact] = []
     for record in records:
         candidate = Candidate(record.song_id, record.title, record.artist, record.duration_s, album=record.album)
@@ -152,7 +172,8 @@ async def fetch_artifact(
                     logger.debug("LRCLIB %s lookup failed: %s: %s", stage, type(exc).__name__, exc)
 
             artifact = _artifact_from_records(records, track, fuzzy=fuzzy)
-            if artifact is not None and artifact.confidence.value == "high":
+            if (artifact is not None and artifact.confidence.value == "high"
+                    and artifact.timing not in (TimingKind.UNSYNCED, TimingKind.INSTRUMENTAL)):
                 return artifact
 
         artifact = _artifact_from_records(records, track, fuzzy=fuzzy)
@@ -172,26 +193,35 @@ async def fetch_artifact(
 def _artifact_from_records(
     records: list[Record], track: TrackMetadata, *, fuzzy: bool = False
 ) -> LyricsArtifact | None:
-    candidates = [
-        Candidate(record.song_id, record.title, record.artist, record.duration_s, album=record.album)
-        for record in records
-    ]
-    match = best_match(candidates, track, fuzzy=fuzzy)
-    if match is None:
-        return None
-    record = next(
-        item
-        for item in records
-        if Candidate(item.song_id, item.title, item.artist, item.duration_s, album=item.album) == match.candidate
-    )
-    return _artifact_from_record(record, match)
+    # Resolve the best timed match first; an unrelated timed result must not
+    # suppress a matching Unsynced record from the same provider.
+    timed = [record for record in records if parse_lrc(record.synced_lyrics)]
+    lyrics = [record for record in records if record not in timed and record.plain_lyrics.strip()]
+    for group in (timed, lyrics, [record for record in records if record.instrumental]):
+        candidates = [
+            Candidate(record.song_id, record.title, record.artist, record.duration_s, album=record.album)
+            for record in group
+        ]
+        match = best_match(candidates, track, fuzzy=fuzzy)
+        if match is None:
+            continue
+        record = next(
+            item for item in group
+            if Candidate(item.song_id, item.title, item.artist, item.duration_s, album=item.album) == match.candidate
+        )
+        artifact = _artifact_from_record(record, match)
+        if artifact is not None:
+            return artifact
+    return None
 
 
 def _artifact_from_record(record: Record, evidence: MatchEvidence) -> LyricsArtifact | None:
     """Build one validated artifact while retaining the search result metadata."""
-    payload = {"syncedLyrics": record.synced_lyrics}
+    payload = {"syncedLyrics": record.synced_lyrics, "plainLyrics": record.plain_lyrics}
+    if record.instrumental and not record.synced_lyrics.strip() and not record.plain_lyrics.strip():
+        payload["instrumental"] = "true"
     lines = parse_payload(payload)
-    if not lines:
+    if not lines and not record.instrumental:
         return None
     return LyricsArtifact(
         provider="lrclib",
@@ -203,4 +233,6 @@ def _artifact_from_record(record: Record, evidence: MatchEvidence) -> LyricsArti
         payload=payload,
         lines=lines,
         confidence=evidence.confidence,
+        timing=(TimingKind.LINE if parse_lrc(record.synced_lyrics) else
+                TimingKind.UNSYNCED if lines else TimingKind.INSTRUMENTAL),
     )

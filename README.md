@@ -57,25 +57,26 @@ No separate `playerctl` reader, player-specific integration, credentials, or oth
 
 ```mermaid
 flowchart LR
-  A[Local lyrics<br/>.lrc sidecar · audio tags] -->|empty| B[Saved correction]
+  A[Local lyrics<br/>.lrc sidecar · audio tags] -->|no timed lyrics| B[Saved correction]
   B -->|empty| C[Lyrics cache]
   C -->|empty| D{Network<br/>Auto?}
   D -->|yes| E[NetEase · LRCLIB · Kugou]
   E --> F[Ranking]
   D -->|Offline| G[Not found]
-  A -->|found| H((Lyrics))
+  A -->|timed| H((Lyrics))
+  A -.->|Unsynced if nothing timed| H
   B -->|found| H
   C -->|found| H
   F --> H
 ```
 
-Each step stops at the first hit. With the network on, the enabled providers are asked and their answers ranked by how well they match the track. The bar shows the current step while it works; the panel lists every source's outcome.
+Timed local lyrics resolve immediately. Untimed text from a local `.lrc` sidecar or embedded tags is shown as **Unsynced** if no timed result exists: in Auto mode Resolution continues through saved corrections, the Lyrics Cache and enabled providers so a timed result can win; with network off the local text remains available. A matching automatic Lyrics Cache hit (including Unsynced or Instrumental) resolves without another network lookup; timed cache entries outrank untimed ones. Refresh skips automatic cache and rechecks providers. The bar shows each Resolution Step while it works; the panel lists every source's outcome.
 
 ![The panel listing the lookup steps: Local lyrics, Saved correction and Lyrics Cache empty, NetEase found, then Ranking](media/lookup.gif)
 
 A real lookup of a track with no local lyrics, captured at real speed in the gruvbox theme.
 
-Found the wrong song? Middle-click opens manual search: query one provider, pin the exact result, forget it later.
+Found the wrong song? Middle-click opens Manual Search: query one provider, then pin the exact result or forget it later. Unsynced candidates appear below timed ones, marked "unsynced"; a pinned Unsynced choice stays available offline and takes precedence over automatic results.
 
 ## Timing you can trust
 
@@ -86,8 +87,11 @@ The panel badge says which timing the lyrics actually carry:
 | **Word sync** | Every line has word timing; the fill moves within the line. |
 | **Line sync** | Line timestamps only; the whole line lights up at once. |
 | **Word + line** | Some lines have word timing, others only line timing. |
+| **Unsynced** | Only untimed text exists anywhere (LRCLIB plain lyrics, untimed tags or `.lrc`). The panel shows it statically; the bar keeps the track title. Nothing is highlighted, scrolled, sought or offset. |
 
 "Synchronized lyrics" from a provider does not guarantee word timing, and N501 Verse never invents it. If a track is out of step, `[` and `]` shift its lyrics by 100 ms; the offset is remembered for those lyrics.
+
+LRCLIB may identify an **Instrumental Track** with no lyrics. This is a ready result, not a failed Resolution: timed lyrics from any source win first, then Unsynced text, then the Instrumental Track result. The bar marks the title "Instrumental"; the panel shows a dedicated empty state with Manual Search still available. It has no lyric seeking or Timing Offset. The result is saved in the automatic Lyrics Cache and removed by Clear cache.
 
 ## What the bar shows
 
@@ -124,9 +128,28 @@ Left-click the widget to open it: the whole lyric sheet with the active line hig
 | `/` | Open manual search |
 | `b` | Return from search to lyrics |
 
+### Keyboard shortcut and Omarchy menu
+
+Add this line to `~/.config/hypr/bindings.lua` to toggle the panel (change the key if it is already in use):
+
+```lua
+o.bind("SUPER + ALT + L", "N501 Verse lyrics", "omarchy-shell n501.karaoke toggle")
+```
+
+Add these entries inside `~/.config/omarchy/extensions/omarchy-menu.jsonc`:
+
+```jsonc
+"personal.lyrics": {"label":"N501 Verse"},
+"personal.lyrics.panel": {"label":"Open lyrics panel","action":"omarchy-shell n501.karaoke open"},
+"personal.lyrics.search": {"label":"Manual Search","action":"omarchy-shell n501.karaoke search"}
+```
+
+The IPC target is `n501.karaoke`. `open` shows the lyric panel; `search` opens it in Manual Search with the query focused. These commands require the running shell to have the plugin widget loaded.
+
 ## Settings
 
 - **Bar size** — Compact, Standard, or Expanded.
+- **Lyrics size** — Small, Normal (default), or Large for lyric and translation lines in the panel only; the bar stays the same size.
 - **Network** — Auto or Offline.
 - **Netease** — experimental community source; word timing depends on availability.
 - **LRCLIB** — free community source; ordinary results are line-timed.
@@ -139,7 +162,7 @@ Provider availability, timing, rights, and correctness are not guaranteed. Netwo
 ## Privacy and storage
 
 - Network lookups happen only in **Auto** mode. LRCLIB requests identify the plugin in their `User-Agent`.
-- Local sidecars and embedded lyrics are read from the active local track; they are not sent to a network provider by the local-first path.
+- Local sidecars and embedded lyrics are read from the active local track; their text is not sent to a network provider. Auto mode may still query providers using the track metadata when local lyrics are Unsynced.
 - Everything the plugin writes is in three SQLite files (`~/.cache` and `~/.local/state` when `$XDG_CACHE_HOME`/`$XDG_STATE_HOME` are unset). Directories are created `0700` and files `0600`. Each file has a fixed row limit, so none of them grows without bound:
 
   | File | Holds | Limit |

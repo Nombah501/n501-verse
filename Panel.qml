@@ -29,6 +29,8 @@ Panel {
         return "standard"
     }
     readonly property bool motionEnabled: setting("motionEnabled", true) !== false
+    readonly property real lyricScale: setting("lyricsSize", "Normal") === "Small" ? 0.85
+        : setting("lyricsSize", "Normal") === "Large" ? 1.2 : 1
     readonly property int configuredWidth: root.layoutMode === "compact" ? 320
         : (root.layoutMode === "expanded" ? 720 : 520)
     readonly property int slotWidth: vertical ? barSize : configuredWidth
@@ -41,9 +43,10 @@ Panel {
         ? String(karaokeService.activePlayer.trackArtist || "") : ""
     readonly property string titleName: karaokeService && karaokeService.activePlayer
         ? String(karaokeService.activePlayer.trackTitle || "") : ""
-    // Timing is claimed only for a ready document with real word/line timing.
     readonly property string syncLabel: {
         if (!root.ready || !karaokeService) return ""
+        if (karaokeService.timing === "none") return "Unsynced"
+        if (karaokeService.timing === "instrumental") return "Instrumental"
         if (karaokeService.timing === "word")
             return karaokeService.timingDetail === "mixed" ? "Word + line" : "Word sync"
         return karaokeService.timing === "line" ? "Line sync" : ""
@@ -54,8 +57,8 @@ Panel {
         if (label === "") return ""
         var text = root.syncLabel !== "" ? label + " (" + root.syncLabel + ")" : label
         if (root.ready) {
-            var line = karaokeService && karaokeService.currentLine
-                && typeof karaokeService.currentLine.text === "string"
+            var line = karaokeService && karaokeService.timing !== "none"
+                && karaokeService.currentLine && typeof karaokeService.currentLine.text === "string"
                 ? karaokeService.currentLine.text : ""
             if (line !== "") text += "\n" + line
             text += "\nClick: panel · Right: refresh · Middle: search"
@@ -111,6 +114,21 @@ Panel {
     readonly property alias failureSummaryVisible: failureSummary.visible
     // The lyric clip keeps its size across line and progress states.
     readonly property alias lyricClipItem: lineItem
+    readonly property alias barDisplayText: unsyncedBarText.text
+    readonly property alias unsyncedBadgeVisible: unsyncedBadge.visible
+    readonly property alias unsyncedBarVisible: unsyncedBarText.visible
+    readonly property alias renderedSeekHint: seekHintText.text
+    function renderedRowTime(index) {
+        var row = lyricList.itemAtIndex(index)
+        return row && row.timeText ? row.timeText.text : ""
+    }
+    readonly property alias instrumentalStateVisible: instrumentalState.visible
+    readonly property alias offsetBlockVisible: offsetBlock.visible
+    function staticLyricText() {
+        var row = lyricList.itemAtIndex(0)
+        return row && row.staticPaintText && row.staticPaintText.visible
+            ? row.staticPaintText.text : ""
+    }
     readonly property bool wordSyncGlyphVisible: wordSyncGlyph.visible && wordSyncGlyph.opacity > 0
     readonly property string wordSyncTrackKey: karaokeService ? String(karaokeService.trackKey || "") : ""
     property string confirmedWordSyncTrackKey: ""
@@ -165,6 +183,11 @@ Panel {
         var svc = root.karaokeService
         var row = svc ? lyricList.itemAtIndex(svc.activeLineIndex) : null
         return row ? row.activePaintText : null
+    }
+    function activePanelTranslationText() {
+        var svc = root.karaokeService
+        var row = svc ? lyricList.itemAtIndex(svc.activeLineIndex) : null
+        return row ? row.translationText : null
     }
     // Public observable for popup sizing: the smoke asserts the panel
     // content width follows the configured bar mode.
@@ -244,6 +267,8 @@ Panel {
         barTextColor.b, 0.62)
     readonly property string panelFont: bar ? bar.fontFamily : Style.font.family
     readonly property string panelTiming: {
+        if (karaokeService && karaokeService.timing === "none") return "Unsynced"
+        if (karaokeService && karaokeService.timing === "instrumental") return "Instrumental"
         if (karaokeService && karaokeService.timing === "word" && karaokeService.timingDetail === "mixed")
             return "Word + line"
         return karaokeService && karaokeService.timing === "word" ? "Word sync" : "Line sync"
@@ -304,7 +329,8 @@ Panel {
         var indices = ({})
         for (var i = 0; i < steps.length; i++) {
             var step = steps[i]
-            if (step.stage === "ranking" && step.outcome !== "found") continue
+            if (step.stage === "ranking" && ["found", "unsynced", "instrumental"].indexOf(step.outcome) < 0)
+                continue
             var key = step.stage === "provider" ? step.stage + ":" + step.provider : step.stage
             if (indices[key] === undefined) {
                 indices[key] = rows.length
@@ -337,6 +363,7 @@ Panel {
         return (ms < 0 ? "−" : "+") + Math.abs(ms) + " ms"
     }
     readonly property bool offsetControlsAvailable: !!karaokeService
+        && karaokeService.timing !== "none" && karaokeService.timing !== "instrumental"
         && karaokeService.offsetAvailable === true
     readonly property string offsetSupportHint: {
         if (!karaokeService || typeof karaokeService.capabilityExplanation !== "function") return ""
@@ -405,7 +432,9 @@ Panel {
         if (root.karaokeService && typeof root.karaokeService.clearForgetError === "function")
             root.karaokeService.clearForgetError()
     }
-    readonly property bool seekSupported: !!karaokeService && !!karaokeService.activePlayer
+    readonly property bool seekSupported: !!karaokeService && karaokeService.timing !== "none"
+        && karaokeService.timing !== "instrumental"
+        && !!karaokeService.activePlayer
         && karaokeService.activePlayer.canSeek === true
         && karaokeService.activePlayer.positionSupported === true
     readonly property string seekHint: root.seekSupported ? "" : "Seeking is unavailable for this player"
@@ -571,7 +600,9 @@ Panel {
     }
 
     function followCurrent() {
-        if (!root.karaokeService || !Array.isArray(root.karaokeService.lines)) return
+        if (!root.karaokeService || root.karaokeService.timing === "none"
+                || root.karaokeService.timing === "instrumental"
+                || !Array.isArray(root.karaokeService.lines)) return
         var index = Number(root.karaokeService.activeLineIndex)
         if (index < 0 || index >= root.karaokeService.lines.length) return
         root.autoFollowing = true
@@ -583,7 +614,7 @@ Panel {
 
     function seekLyricRow(index) {
         var svc = root.karaokeService
-        if (!svc || typeof svc.seekToLine !== "function") return false
+        if (!root.seekSupported || !svc || typeof svc.seekToLine !== "function") return false
         if (svc.seekToLine(index) !== true) return false
         root.followEnabled = true
         if (lyricList.count > index) lyricList.positionViewAtIndex(index, ListView.Center)
@@ -1261,7 +1292,8 @@ Panel {
             parts.push(KaraokeModel.formatTime(Number(row.duration)))
         if (typeof row.provider === "string" && row.provider !== "") parts.push(row.provider)
         if (typeof row.confidence === "string" && row.confidence !== "") parts.push(row.confidence)
-        if (typeof row.timing === "string" && row.timing !== "") parts.push(row.timing)
+        if (typeof row.timing === "string" && row.timing !== "")
+            parts.push(row.timing === "none" ? "unsynced" : row.timing)
         parts.push(row.hasTranslation === true ? "translation" : "no translation")
         return parts.join(" · ")
     }
@@ -1501,6 +1533,22 @@ Panel {
             font.pixelSize: Style.font.body
             opacity: root.finalFailure ? root.failureOpacity
                 : (root.pauseSceneVisible ? 0.5 : 1)
+        }
+        Text {
+            id: unsyncedBarText
+            anchors.centerIn: parent
+            width: Math.max(0, root.configuredWidth - Style.spacing.md * 2)
+            visible: root.ready && !root.vertical && root.karaokeService
+                && (root.karaokeService.timing === "none"
+                    || root.karaokeService.timing === "instrumental")
+            textFormat: Text.PlainText
+            text: root.titleName + (root.karaokeService
+                && root.karaokeService.timing === "instrumental" ? " · Instrumental" : "")
+            color: root.bar ? root.bar.barForeground : Color.bar.text
+            font.family: root.bar ? root.bar.fontFamily : Style.font.family
+            font.pixelSize: Style.font.body
+            horizontalAlignment: Text.AlignHCenter
+            elide: Text.ElideRight
         }
         Text {
             anchors.left: glyphText.right
@@ -1907,6 +1955,7 @@ Panel {
                     width: parent.width
                     height: 26
                     visible: root.serviceState === "ready" && !root.searchMode
+                        && root.karaokeService.timing !== "instrumental"
                     Rectangle {
                         anchors.bottom: parent.bottom
                         width: parent.width
@@ -1969,7 +2018,8 @@ Panel {
                             width: parent.width
                             textFormat: Text.PlainText
                             text: root.resolutionStepText(modelData)
-                            color: modelData.outcome === "found" ? root.panelForeground : root.secondaryForeground
+                            color: modelData.outcome === "found" || modelData.outcome === "instrumental"
+                                ? root.panelForeground : root.secondaryForeground
                             font.family: root.panelFont
                             font.pixelSize: Style.font.caption
                             horizontalAlignment: Text.AlignHCenter
@@ -2290,11 +2340,52 @@ Panel {
                     }
                 }
 
+                Text {
+                    id: unsyncedBadge
+                    width: parent.width
+                    visible: root.ready && !root.searchMode && root.karaokeService
+                        && root.karaokeService.timing === "none"
+                    text: "Unsynced"
+                    textFormat: Text.PlainText
+                    color: Color.accent
+                    font.family: root.panelFont
+                    font.pixelSize: Style.font.caption
+                    horizontalAlignment: Text.AlignHCenter
+                }
+                Column {
+                    id: instrumentalState
+                    width: parent.width
+                    spacing: Style.space(4)
+                    visible: root.ready && !root.searchMode && root.karaokeService
+                        && root.karaokeService.timing === "instrumental"
+                    Text {
+                        width: parent.width
+                        text: "Instrumental Track"
+                        textFormat: Text.PlainText
+                        color: root.panelForeground
+                        font.family: root.panelFont
+                        font.pixelSize: Style.font.body
+                        horizontalAlignment: Text.AlignHCenter
+                    }
+                    Text {
+                        width: parent.width
+                        text: "LRCLIB identifies this track as instrumental."
+                        textFormat: Text.PlainText
+                        color: root.secondaryForeground
+                        font.family: root.panelFont
+                        font.pixelSize: Style.font.caption
+                        horizontalAlignment: Text.AlignHCenter
+                        wrapMode: Text.Wrap
+                    }
+                }
+
+
                 ListView {
                     id: lyricList
                     width: parent.width
                     height: Math.max(Math.min(220, contentHeight), root.menuOpen ? menuCard.height : 0)
                     visible: root.serviceState === "ready" && !root.searchMode
+                        && root.karaokeService.timing !== "instrumental"
                     clip: true
                     model: root.karaokeService ? root.karaokeService.lines : []
                     spacing: Style.space(7)
@@ -2337,6 +2428,9 @@ Panel {
                         required property var modelData
                         required property int index
                         readonly property var activePaintText: currentRenderer.paintedText
+                        readonly property var staticPaintText: staticLine
+                        readonly property var translationText: rowTranslation
+                        readonly property alias timeText: rowTime
                         width: lyricList.width
                         height: rowColumn.implicitHeight
 
@@ -2346,7 +2440,7 @@ Panel {
                             hasCursor: root.seekSupported && root.cursorActive
                                 && root.focusSection === "lyrics"
                                 && root.selectedIndex === rowItem.index
-                            current: root.karaokeService
+                            current: root.karaokeService && root.karaokeService.timing !== "none"
                                 && rowItem.index === root.karaokeService.activeLineIndex
                         }
                         Column {
@@ -2355,13 +2449,15 @@ Panel {
                             spacing: Style.space(2)
 
                             Text {
+                                id: staticLine
                                 width: parent.width
-                                visible: rowItem.index !== root.karaokeService.activeLineIndex
+                                visible: root.karaokeService.timing === "none"
+                                    || rowItem.index !== root.karaokeService.activeLineIndex
                                 textFormat: Text.PlainText
                                 text: rowItem.modelData.text || ""
                                 color: root.secondaryForeground
                                 font.family: Style.font.family
-                                font.pixelSize: Style.font.body
+                                font.pixelSize: Math.round(Style.font.body * root.lyricScale)
                                 horizontalAlignment: Text.AlignHCenter
                                 wrapMode: Text.Wrap
                             }
@@ -2369,7 +2465,8 @@ Panel {
                             Item {
                                 id: currentStage
                                 width: parent.width
-                                visible: rowItem.index === root.karaokeService.activeLineIndex
+                                visible: root.karaokeService.timing !== "none"
+                                    && rowItem.index === root.karaokeService.activeLineIndex
                                 height: visible ? Math.max(24, currentRenderer.implicitHeight) : 0
                                 KaraokeLine {
                                     id: currentRenderer
@@ -2386,11 +2483,12 @@ Panel {
                                     foreground: root.panelForeground
                                     muted: root.secondaryForeground
                                     fontFamily: Style.font.family
-                                    fontSize: Style.font.body
+                                    fontSize: Math.round(Style.font.body * root.lyricScale)
                                 }
                             }
 
                             Text {
+                                id: rowTranslation
                                 width: parent.width
                                 visible: root.translationsShown && rowItem.modelData
                                     && String(rowItem.modelData.translation || "") !== ""
@@ -2398,14 +2496,16 @@ Panel {
                                 text: rowItem.modelData ? String(rowItem.modelData.translation || "") : ""
                                 color: root.secondaryForeground
                                 font.family: Style.font.family
-                                font.pixelSize: Style.font.caption
+                                font.pixelSize: Math.round(Style.font.caption * root.lyricScale)
                                 horizontalAlignment: Text.AlignHCenter
                                 wrapMode: Text.Wrap
                             }
 
                             Text {
+                                id: rowTime
                                 width: parent.width
                                 textFormat: Text.PlainText
+                                visible: root.karaokeService.timing !== "none"
                                 text: KaraokeModel.formatTime(Number(rowItem.modelData.start))
                                 color: root.secondaryForeground
                                 font.family: root.panelFont
@@ -2424,10 +2524,13 @@ Panel {
                 }
 
                 Text {
+                    id: seekHintText
                     width: parent.width
                     textFormat: Text.PlainText
+                    visible: root.serviceState === "ready" && !root.searchMode
+                        && root.karaokeService.timing !== "none"
+                        && root.karaokeService.timing !== "instrumental" && root.seekHint !== ""
                     text: root.seekHint
-                    visible: root.serviceState === "ready" && !root.searchMode && root.seekHint !== ""
                     color: root.secondaryForeground
                     font.family: root.panelFont
                     font.pixelSize: Style.font.caption
@@ -2441,6 +2544,8 @@ Panel {
                     width: parent.width
                     spacing: Style.space(4)
                     visible: root.serviceState === "ready" && !root.searchMode
+                        && root.karaokeService.timing !== "none"
+                        && root.karaokeService.timing !== "instrumental"
                     // The offset value is the reset button in the action stepper.
                     Text {
                         width: parent.width
@@ -2729,6 +2834,7 @@ Panel {
         function show(): void { root.open() }
         function hide(): void { root.close() }
         function toggle(): void { root.toggle() }
+        function search(): void { root.openSearch(); root.open() }
     }
 
     Component.onCompleted: {

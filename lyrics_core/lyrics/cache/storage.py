@@ -12,7 +12,7 @@ from typing import Final
 
 from ..artifact import LyricsArtifact
 from ..match import Candidate, MatchConfidence, MatchEvidence, TrackMetadata, evaluate_match
-from ..models import LyricLine
+from ..models import LyricLine, TimingKind
 from ..title_grammar import NORMALIZER_VERSION
 from .models import (
     CacheDeleteResult,
@@ -80,12 +80,23 @@ class LyricsCacheStorage:
                 evidence = self._match_row(row, track)
                 if evidence.confidence is MatchConfidence.HIGH:
                     matches.append((evidence, row))
-            matches.sort(key=lambda item: self._match_sort_key(item[0]), reverse=True)
-            for evidence, row in matches:
-                hit = self._read_hit(connection, row, evidence, parser, LyricsCacheMode.AUTO)
-                if hit is not None:
-                    return hit
-            return None
+            hits = [
+                (hit, evidence) for evidence, row in matches
+                if (hit := self._read_hit(connection, row, evidence, parser, LyricsCacheMode.AUTO,
+                                          touch=False)) is not None
+            ]
+            if not hits:
+                return None
+            selected = max(hits, key=lambda item: (
+                0 if item[0].artifact.timing is TimingKind.INSTRUMENTAL else
+                1 if item[0].artifact.timing is TimingKind.UNSYNCED else 2,
+                self._match_sort_key(item[1]),
+            ))[0]
+            connection.execute(
+                "UPDATE lyrics SET last_accessed = ? WHERE provider = ? AND provider_song_id = ?",
+                (time.time(), provider, selected.artifact.provider_song_id),
+            )
+            return selected
 
     def lookup_manual(
         self,
@@ -290,6 +301,7 @@ class LyricsCacheStorage:
         evidence: MatchEvidence,
         parser: PayloadParser,
         mode: LyricsCacheMode,
+        *, touch: bool = True,
     ) -> LyricsCacheHit | None:
         """Parse one selected row and remove it when its payload is invalid."""
         provider = row["provider"]
@@ -300,9 +312,10 @@ class LyricsCacheStorage:
             ):
                 raise TypeError("cached payload is not a string map")
             payload: dict[str, str] = raw_payload
+            instrumental = provider == "lrclib" and payload.get("instrumental") == "true"
             lines = parser(payload)
-            if not lines:
-                raise ValueError("cached payload has no timed lyrics")
+            if not lines and not instrumental:
+                raise ValueError("cached payload has no lyrics")
         except (json.JSONDecodeError, TypeError, ValueError):
             connection.execute(
                 "DELETE FROM lyrics WHERE provider = ? AND provider_song_id = ?",
@@ -310,10 +323,11 @@ class LyricsCacheStorage:
             )
             return None
 
-        connection.execute(
-            "UPDATE lyrics SET last_accessed = ? WHERE provider = ? AND provider_song_id = ?",
-            (time.time(), provider, row["provider_song_id"]),
-        )
+        if touch:
+            connection.execute(
+                "UPDATE lyrics SET last_accessed = ? WHERE provider = ? AND provider_song_id = ?",
+                (time.time(), provider, row["provider_song_id"]),
+            )
         return LyricsCacheHit(
             artifact=LyricsArtifact(
                 provider=provider,
@@ -325,6 +339,10 @@ class LyricsCacheStorage:
                 payload=payload,
                 lines=lines,
                 confidence=evidence.confidence,
+                timing=(TimingKind.INSTRUMENTAL if instrumental and not lines else
+                        TimingKind.UNSYNCED if provider == "lrclib"
+                        and not any(line.start != 0 or line.end != 0 or line.words for line in lines)
+                        and bool(payload.get("plainLyrics")) else None),
             ),
             mode=mode,
         )

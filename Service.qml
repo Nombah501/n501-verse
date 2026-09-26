@@ -54,7 +54,8 @@ Item {
     property string offsetError: ""
     property var offsetRetry: null
     property int offsetSuccessSerial: 0
-    readonly property bool offsetAvailable: root.offsetKey !== null && root.offsetKey !== undefined
+    readonly property bool offsetAvailable: root.timing !== "none" && root.timing !== "instrumental"
+        && root.offsetKey !== null && root.offsetKey !== undefined
     property var capabilities: null
     property string coreVersion: ""
     property string capabilitiesError: ""
@@ -141,7 +142,9 @@ Item {
     }
     readonly property string trackKey: root.currentTrackKey()
     readonly property var lines: document && Array.isArray(document.lines) ? document.lines : []
-    readonly property string timingDetail: KaraokeModel.timingDetail(root.lines)
+    readonly property string timingDetail: root.timing === "none" ? "unsynced"
+        : root.timing === "instrumental" ? "instrumental"
+        : KaraokeModel.timingDetail(root.lines)
     readonly property string helperPath: String(Qt.resolvedUrl("bin/karaoke-lyrics")).replace(/^file:\/\//, "")
     function finite(value) {
         return typeof value === "number" && isFinite(value)
@@ -1144,7 +1147,8 @@ Item {
     }
 
     function seekToLine(index) {
-        if (root.state !== "ready") return false
+        if (root.state !== "ready" || root.timing === "none"
+                || root.timing === "instrumental") return false
         if (typeof index !== "number" || Math.floor(index) !== index) return false
         if (!Array.isArray(root.lines) || index < 0 || index >= root.lines.length) return false
         var line = root.lines[index]
@@ -1530,7 +1534,8 @@ Item {
         }
         if (response.status !== "ready") return true
         if (typeof response.provider !== "string" || response.provider === "") return false
-        if (["word", "line"].indexOf(response.timing) < 0 || !Array.isArray(response.lines)) return false
+        if (["word", "line", "none", "instrumental"].indexOf(response.timing) < 0
+                || !Array.isArray(response.lines)) return false
         var previousStart = -Infinity
         var hasWords = false
         for (var i = 0; i < response.lines.length; i++) {
@@ -1562,8 +1567,18 @@ Item {
             }
             if (sawTimedWord && wordText !== line.text) return false
         }
-        if (response.lines.length === 0) return false
-        if (response.timing !== (hasWords ? "word" : "line")) return false
+        if (response.timing === "instrumental") {
+            if (response.lines.length !== 0 || response.offsetKey != null
+                    || (response.offsetMs !== undefined && response.offsetMs !== 0)) return false
+        } else if (response.lines.length === 0) return false
+        if (response.timing === "none") {
+            if (hasWords || response.lines.some(function(line) {
+                return line.start !== 0 || line.end !== 0 || line.words.length !== 0
+            })) return false
+            if (response.offsetKey != null || (response.offsetMs !== undefined && response.offsetMs !== 0))
+                return false
+        } else if (response.timing !== "instrumental"
+                && response.timing !== (hasWords ? "word" : "line")) return false
         if (response.providerSongId !== undefined && response.providerSongId !== null
                 && typeof response.providerSongId !== "string") return false
         if (typeof response.providerSongId === "string"
@@ -1643,6 +1658,8 @@ Item {
     }
 
     function stepPhrase(step) {
+        if (step.outcome === "instrumental") return "Instrumental · " + (
+            step.stage === "cache" ? "Cache" : root.providerLabel(step.provider))
         if (step.stage === "local") return "Local lyrics…"
         if (step.stage === "alias") return "Saved correction…"
         if (step.stage === "cache") return step.outcome === "found" ? "Found · Cache" : "Cache…"
@@ -1681,7 +1698,7 @@ Item {
                 || typeof step.provider !== "string" || typeof step.outcome !== "string"
                 || step.provider.length > 32 || step.outcome.length > 32
                 || (step.stage === "provider" && ["lrclib", "netease", "kugou"].indexOf(step.provider) < 0)
-                || ["checking", "query", "found", "empty", "timeout", "error", "start"].indexOf(step.outcome) < 0)
+                || ["checking", "query", "found", "unsynced", "instrumental", "empty", "timeout", "error", "start"].indexOf(step.outcome) < 0)
             return false
         root.resolutionSteps = root.resolutionSteps.concat([{
             stage: step.stage, provider: step.provider, outcome: step.outcome
@@ -1825,7 +1842,14 @@ Item {
 
 
     function performProjection(force) {
-        if (root.state !== "ready" || !Array.isArray(root.lines) || root.lines.length === 0 || !root.activePlayer) {
+        if (root.timing === "none" && root.state === "ready" && root.activePlayer) {
+            var untimedPosition = Number(root.activePlayer.position)
+            root.publishProjectionSnapshot(root.neutralProjectionSnapshot(
+                root.finite(untimedPosition) && untimedPosition >= 0 ? untimedPosition : -1))
+            return
+        }
+        if (root.timing === "instrumental" || root.state !== "ready"
+                || !Array.isArray(root.lines) || root.lines.length === 0 || !root.activePlayer) {
             root.publishProjectionSnapshot(root.neutralProjectionSnapshot(root.position))
             return
         }
@@ -1886,7 +1910,8 @@ Item {
     function updateProjectionTimer() {
         var playing = root.activePlayer && root.activePlayer.isPlaying === true
         projectionTimer.interval = root.timing === "word" ? 33 : 200
-        projectionTimer.running = root.state === "ready" && playing
+        projectionTimer.running = root.state === "ready"
+            && root.timing !== "instrumental" && playing
         if (!playing) root.performProjection(true)
     }
 

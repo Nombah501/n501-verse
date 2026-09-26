@@ -1,14 +1,15 @@
-"""Load timed lyrics from a local audio file or its metadata."""
+"""Load lyrics from a local audio file or its metadata."""
 
 from __future__ import annotations
 
 import os
+import re
 import stat
 from pathlib import Path
 
 from ..file_access import BoundedRegularFileReader
-from .lrc_parser import parse_lrc
-from .models import LyricLine
+from .lrc_parser import MAX_LINES, parse_lrc
+from .models import LyricLine, TimingKind
 
 #: A sidecar is a lyric file; anything near this size is not one. The read is
 #: bounded because the path comes from a player, not from this program.
@@ -21,19 +22,31 @@ def _read_regular_file(path: Path) -> bytes | None:
 
 
 def load_local_lyrics(audio_path: Path) -> list[LyricLine]:
-    """Return timed lines for a local audio file from the first source that has them.
+    """Prefer timed sidecar or embedded lyrics; otherwise use the first Unsynced source."""
+    sidecar = load_sidecar_lyrics(audio_path)
+    if sidecar and sidecar[0].timing is not TimingKind.UNSYNCED:
+        return sidecar
+    embedded = load_embedded_lyrics(audio_path)
+    if embedded and embedded[0].timing is not TimingKind.UNSYNCED:
+        return embedded
+    return sidecar or embedded
 
-    Two sources, tried in order: an LRC file sitting beside the audio, then the
-    lyrics embedded in the audio's own tags. The name says which job this is,
-    because a function called load_sidecar that also parses tags left every caller
-    having to know that its name described half of what it did.
-    """
-    lines = load_sidecar_lyrics(audio_path)
-    return lines if lines else load_embedded_lyrics(audio_path)
+
+def _unsynced_lines(text: str) -> list[LyricLine]:
+    lines: list[LyricLine] = []
+    for raw in text.splitlines():
+        content = raw.strip()
+        if not content or re.fullmatch(r"\[[A-Za-z][\w-]*:.*\]", content):
+            continue
+        lines.append(LyricLine(len(lines), f"plain-{len(lines)}", 0.0, 0.0, content, "",
+                               timing=TimingKind.UNSYNCED))
+        if len(lines) >= MAX_LINES:
+            break
+    return lines
 
 
 def load_sidecar_lyrics(audio_path: Path) -> list[LyricLine]:
-    """Return timed lines from the LRC file adjacent to the audio file."""
+    """Return timed or Unsynced lines from the LRC file adjacent to the audio file."""
     if not audio_path.name:
         # A player publishing xesam:url = "file:///" reaches here as Path("/"), and
         # with_suffix raises ValueError on a path with no name — outside the OSError
@@ -51,16 +64,15 @@ def load_sidecar_lyrics(audio_path: Path) -> list[LyricLine]:
         return []
     for encoding in ("utf-8", "gb18030"):
         try:
-            lines = parse_lrc(raw.decode(encoding))
-            if lines:
-                return lines
+            text = raw.decode(encoding)
+            return parse_lrc(text) or _unsynced_lines(text)
         except UnicodeDecodeError:
             continue
     return []
 
 
 def load_embedded_lyrics(audio_path: Path) -> list[LyricLine]:
-    """Return timed lines from the audio file's own tags.
+    """Return timed or Unsynced lines from the audio file's own tags.
 
     The path came from a player, so the file is opened once and judged through
     that descriptor rather than by name: checking the name and then letting the
@@ -85,10 +97,14 @@ def load_embedded_lyrics(audio_path: Path) -> list[LyricLine]:
             audio = mutagen.File(handle)
             if audio is None or audio.tags is None:
                 return []
+            unsynced: list[LyricLine] = []
             for text in _embedded_texts(audio.tags):
                 lines = parse_lrc(text)
                 if lines:
                     return lines
+                if not unsynced:
+                    unsynced = _unsynced_lines(text)
+            return unsynced
     except (AttributeError, KeyError, IndexError, OSError, TypeError, ValueError, mutagen.MutagenError):
         return []
     finally:

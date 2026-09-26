@@ -46,10 +46,12 @@ try:  # Optional local-file capability; never gates core fetch.
     from lyrics_core.lyrics.hint import from_player as _hint_from_player
     from lyrics_core.lyrics.local import load_local_lyrics as _load_local_lyrics
     from lyrics_core.lyrics.artifact import LyricsArtifact as _LyricsArtifact
+    from lyrics_core.lyrics.models import TimingKind as _TimingKind
 except (ImportError, ModuleNotFoundError, AttributeError):  # pragma: no cover - machine dependent
     _hint_from_player = None
     _load_local_lyrics = None
     _LyricsArtifact = None
+    _TimingKind = None
 LOCAL_AVAILABLE = (
     _hint_from_player is not None and _load_local_lyrics is not None and _LyricsArtifact is not None
 )
@@ -249,6 +251,10 @@ def _evidence_sort_key(artifact: Any, track: Any) -> tuple[Any, ...]:
             similarity, -gap if math.isfinite(gap) else float("-inf"))
 
 
+def _timing_rank(artifact: Any) -> int:
+    return {"Unsynced": 1, "Instrumental": 0}.get(str(getattr(artifact, "timing", "")), 3)
+
+
 def _ranked(artifacts: Iterable[Any], track: Any = None) -> list[Any]:
     indexed = {name: index for index, name in enumerate(PROVIDER_ORDER)}
     usable = [item for item in artifacts if _confidence_rank(getattr(item, "confidence", "none")) > 0]
@@ -273,6 +279,7 @@ def _ranked(artifacts: Iterable[Any], track: Any = None) -> list[Any]:
             return (parts[0], parts[1], float(parts[2]), gap_value)
         usable.sort(
             key=lambda item: (
+                -_timing_rank(item),
                 -evidence_key(item)[0],
                 -evidence_key(item)[1],
                 -evidence_key(item)[2],
@@ -284,6 +291,7 @@ def _ranked(artifacts: Iterable[Any], track: Any = None) -> list[Any]:
         return usable
     usable.sort(
         key=lambda item: (
+            -_timing_rank(item),
             -_confidence_rank(getattr(item, "confidence", "none")),
             -int(_artifact_has_words(item)),
             indexed.get(str(getattr(item, "provider", "")), len(indexed)),
@@ -423,7 +431,8 @@ def _serialize_artifact(artifact: Any, request_id: int, track: Any, *,
     if confidence not in ("high", "medium"):
         raise InvalidPayload("confidence")
     raw_lines = getattr(artifact, "lines", None)
-    if not isinstance(raw_lines, (list, tuple)) or not raw_lines:
+    instrumental = str(getattr(artifact, "timing", "")) == "Instrumental"
+    if not isinstance(raw_lines, (list, tuple)) or (bool(raw_lines) == instrumental):
         raise InvalidPayload("lines")
 
     lines: list[dict[str, Any]] = []
@@ -495,7 +504,8 @@ def _serialize_artifact(artifact: Any, request_id: int, track: Any, *,
         "status": "ready",
         "provider": provider,
         "confidence": confidence,
-        "timing": "word" if has_words else "line",
+        "timing": "instrumental" if instrumental else "none" if _timing_rank(artifact) == 1
+                  else "word" if has_words else "line",
         "title": _bound_field(getattr(artifact, "title", "") or _track_fields(track)[0]),
         "artist": _bound_field(getattr(artifact, "artist", "") or _track_fields(track)[1]),
         "album": _bound_field(getattr(artifact, "album", "") or _track_fields(track)[2]),
@@ -591,6 +601,7 @@ def _local_artifact(track: Any, url: Any) -> Any | None:
         payload={},
         lines=tuple(lines),
         confidence=MatchConfidence.HIGH,
+        timing=_TimingKind.UNSYNCED if lines[0].timing is _TimingKind.UNSYNCED else None,
     )
 
 
@@ -1004,6 +1015,8 @@ def _rebuild_manual_artifact(chosen: Any, track: Any) -> Any:
             payload=payload,
             lines=lines,
             confidence=getattr(chosen, "confidence"),
+            **({"timing": chosen.timing} if _LyricsArtifact is not None
+               and isinstance(chosen, _LyricsArtifact) else {}),
         )
     except InvalidPayload:
         raise
@@ -1056,17 +1069,22 @@ async def fetch_lyrics(track: Any, request_id: int, *, storage: Any = None,
         local = _local_artifact(track, url)
     except Exception:
         local = None
+    local_unsynced_response: dict[str, Any] | None = None
     if local is not None:
         try:
             response = _serialize_artifact(local, request_id, track,
                                            source_kind="local", cache_mode="none",
                                            warnings=warnings)
-            _attach_offset(track, reported_title, url, local, response, offset_store)
-            step("local", "local", "found")
-            return response
+            if response["timing"] == "none":
+                local_unsynced_response = response
+            else:
+                _attach_offset(track, reported_title, url, local, response, offset_store)
+                step("local", "local", "found")
+                return response
         except InvalidPayload:
             pass
-    step("local", outcome="empty")
+    step("local", "local" if local_unsynced_response else "",
+         "unsynced" if local_unsynced_response else "empty")
 
     # Saved corrections are authoritative after local lyrics. The alias key
     # uses _track_for_lookup-normalized playback identity; fetch callers must
@@ -1115,6 +1133,13 @@ async def fetch_lyrics(track: Any, request_id: int, *, storage: Any = None,
             query_track = _track_for_lookup(
                 alias["queryTitle"], alias["queryArtist"], alias["queryAlbum"], None)
             alias_specs = [spec for spec in specs if spec[0] == alias_provider]
+            if provider_specs is None and alias_provider == "lrclib" and _search_lrclib is not None:
+                async def fetch_pinned(session: Any, query: Any, **_kwargs: Any) -> Any:
+                    for artifact in await _search_lrclib(session, query, song_id=alias_song):
+                        if str(getattr(artifact, "provider_song_id", "")) == alias_song:
+                            return artifact
+                    return None
+                alias_specs = [("lrclib", fetch_pinned, alias_specs[0][2])]
 
             alias_exact = {"usable": False, "rejected": False}
             def alias_consider(artifact: Any) -> dict[str, Any] | None:
@@ -1204,6 +1229,8 @@ async def fetch_lyrics(track: Any, request_id: int, *, storage: Any = None,
 
     step("cache", outcome="checking")
     candidates: list[tuple[Any, str]] = []
+    unsynced_cache_response: dict[str, Any] | None = None
+    instrumental_cache_response: dict[str, Any] | None = None
     if storage is not None:
         candidates = _cache_candidates(storage, track, parsers, include_automatic=not refresh)
         # Cache lookups open (and may create) the database file, so tighten
@@ -1215,14 +1242,29 @@ async def fetch_lyrics(track: Any, request_id: int, *, storage: Any = None,
                                                source_kind="cache", cache_mode=cache_mode,
                                                warnings=warnings, saved_alias=saved_alias)
                 _attach_offset(track, reported_title, url, cached, response, offset_store)
-                step("cache", str(getattr(cached, "provider", "")), "found")
-                return response
+                if cache_mode == "manual" or local_unsynced_response is None or response["timing"] not in ("none", "instrumental"):
+                    step("cache", str(getattr(cached, "provider", "")),
+                         "unsynced" if response["timing"] == "none" else
+                         "instrumental" if response["timing"] == "instrumental" else "found")
+                    return response
+                if response["timing"] == "none":
+                    unsynced_cache_response = response
+                else:
+                    instrumental_cache_response = response
             except InvalidPayload:
                 continue
 
     step("cache", outcome="empty")
     network_off = network != "auto"
+    if local_unsynced_response is not None and (network_off or not specs):
+        step("ranking", "local", "found")
+        return local_unsynced_response
     if network_off or not specs:
+        fallback = unsynced_cache_response or instrumental_cache_response
+        if fallback is not None:
+            step("cache", fallback["provider"],
+                 "instrumental" if fallback["timing"] == "instrumental" else "unsynced")
+            return fallback
         return _error_response(request_id, track, "not_found", "network_disabled",
                                warnings=warnings, saved_alias=saved_alias)
 
@@ -1243,7 +1285,18 @@ async def fetch_lyrics(track: Any, request_id: int, *, storage: Any = None,
         docs_by_artifact = {id(artifact): doc for artifact, doc in winners}
         for candidate in _ranked([artifact for artifact, _doc in winners], track):
             response = docs_by_artifact[id(candidate)]
-            step("ranking", str(getattr(candidate, "provider", "")), "found")
+            if response["timing"] in ("none", "instrumental") and local_unsynced_response is not None:
+                local_unsynced_response["providerAttempts"] = _sanitize_attempts(attempts)
+                step("ranking", "local", "found")
+                return local_unsynced_response
+            if response["timing"] == "none" and unsynced_cache_response is not None:
+                break
+            if response["timing"] == "instrumental" and (
+                    unsynced_cache_response is not None or instrumental_cache_response is not None):
+                break
+            step("ranking", str(getattr(candidate, "provider", "")),
+                 "instrumental" if response["timing"] == "instrumental" else
+                 "unsynced" if response["timing"] == "none" else "found")
             response["providerAttempts"] = _sanitize_attempts(attempts)
             response["savedAlias"] = _sanitize_alias(saved_alias)
             if storage is not None and _confidence_value(getattr(candidate, "confidence", "")) == "high":
@@ -1252,6 +1305,16 @@ async def fetch_lyrics(track: Any, request_id: int, *, storage: Any = None,
                 except Exception:
                     pass
             return response
+    if local_unsynced_response is not None:
+        local_unsynced_response["providerAttempts"] = _sanitize_attempts(attempts)
+        step("ranking", "local", "found")
+        return local_unsynced_response
+    fallback = unsynced_cache_response or instrumental_cache_response
+    if fallback is not None:
+        fallback["providerAttempts"] = _sanitize_attempts(attempts)
+        step("ranking", fallback["provider"],
+             "instrumental" if fallback["timing"] == "instrumental" else "unsynced")
+        return fallback
     if usable:
         # At least one provider completed without timed lines: not-found wins;
         # provider_error only when every provider failed.
@@ -1338,7 +1401,7 @@ def _search_row(provider: str, artifact: Any) -> dict[str, Any] | None:
         return None
     if not timed and not lines:
         return None
-    timing = "word" if timed else "line"
+    timing = "none" if _timing_rank(artifact) == 1 else "word" if timed else "line"
     duration = getattr(artifact, "duration_s", None)
     if not _finite(duration) or float(duration) <= 0:
         duration = None
@@ -1395,8 +1458,8 @@ async def search_provider(track: Any, request_id: int, provider: str, *,
             continue
         seen.add(key)
         rows.append(row)
-        if len(rows) >= wanted:
-            break
+    rows.sort(key=lambda row: row["timing"] == "none")
+    rows = rows[:wanted]
     if not rows:
         return _search_error(request_id, lookup, "not_found", "")
     return {
@@ -1696,6 +1759,10 @@ def _offset_permission_warnings(store: Any) -> list[str]:
 
 def _attach_offset(track: Any, reported_title: Any, url: Any,
                    artifact: Any, response: dict[str, Any], offset_store: Any) -> None:
+    if response["timing"] in ("none", "instrumental"):
+        response["offsetKey"] = None
+        response["offsetMs"] = 0
+        return
     if offset_store is None:
         response["offsetKey"] = None
         response["offsetMs"] = 0
