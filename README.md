@@ -6,6 +6,8 @@ N501 Verse fills the current lyric word by word, right in the Omarchy bar. It fi
 
 ![The N501 Verse bar filling lyrics word by word while the Omarchy theme changes](bar-demo.gif)
 
+https://github.com/user-attachments/assets/ecb676f9-04f2-4a07-8469-97a4b4d4ffdd
+
 Real bar renders (no mockups) cycling six stock Omarchy themes. The swatches are the three colours the plugin takes from each theme: bar background, text, and the accent for the active word.
 
 ## At a glance
