@@ -948,7 +948,7 @@ Panel {
         if (root.offsetControlsAvailable) ids.push("earlier", "reset", "later")
         ids.push("menu")
         if (root.menuOpen) {
-            ids.push("details", "layoutMode", "clearCache")
+            ids.push("stage", "details", "layoutMode", "clearCache")
             if (!root.followEnabled) ids.push("follow")
             if (root.karaokeService.offsetError !== "") ids.push("retry_offset")
             if (root.forgetVisible) ids.push("forget")
@@ -966,6 +966,8 @@ Panel {
         case "reset": return root.offsetText
         case "menu": return "⋯"
         case "follow": return "Follow"
+        case "stage": return root.bar && root.bar.shell
+            && root.bar.shell.isPluginOpen(root.moduleName) ? "Close Stage" : "Stage"
         case "details": return root.showDiagnostics ? "Hide details" : "Details"
         case "layoutMode":
             if (root.layoutMode === "compact") return "Bar size: Compact"
@@ -1041,6 +1043,10 @@ Panel {
             return
         case "menu":
             root.menuOpen = !root.menuOpen
+            return
+        case "stage":
+            if (root.bar && root.bar.shell) root.bar.shell.toggle(root.moduleName)
+            root.menuOpen = false
             return
         case "details":
             root.showDiagnostics = !root.showDiagnostics
@@ -2834,6 +2840,9 @@ Panel {
         function show(): void { root.open() }
         function hide(): void { root.close() }
         function toggle(): void { root.toggle() }
+        function stage(): void {
+            if (root.bar && root.bar.shell) root.bar.shell.toggle(root.moduleName)
+        }
         function search(): void { root.openSearch(); root.open() }
     }
 

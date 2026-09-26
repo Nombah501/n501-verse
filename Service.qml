@@ -7,6 +7,10 @@ import "KaraokeModel.js" as KaraokeModel
 
 Item {
     id: root
+    signal stageCloseRequested()
+    // True once the gone/Stopped state has already survived one settle and a
+    // fresh status poll, so the next settle closes the Stage.
+    property bool stageClosePending: false
 
     property var shell: null
     property var mediaService: null
@@ -48,6 +52,7 @@ Item {
     property bool lrclibEnabled: true
     property bool kugouEnabled: true
     property string showTranslations: "On"
+    property bool motionEnabled: true
     readonly property bool translationsVisible: root.showTranslations !== "Off"
     property int offsetMs: 0
     property var offsetKey: null
@@ -135,6 +140,16 @@ Item {
         if (host && host.isPlaying === true) root.heldPlayer = host
     }
     onHostActivePlayerChanged: root.syncHeldPlayer()
+    onActivePlayerChanged: root.scheduleStageCloseCheck()
+    // A Stage opened with no player, or with a Stopped one, must not sit
+    // there empty: the same settled check runs as soon as it opens.
+    function requestStageCloseCheck() { root.scheduleStageCloseCheck() }
+    // Any player change restarts the settle: only a gone/Stopped state that
+    // survives it (and a fresh media-status poll) closes the Stage.
+    function scheduleStageCloseCheck() {
+        stageClosePending = false
+        stageCloseTimer.restart()
+    }
     Connections {
         target: root.hostActivePlayer
         ignoreUnknownSignals: true
@@ -412,6 +427,7 @@ Item {
         var lrclib = root.normalizeBool(opts.lrclibEnabled, true)
         var kugou = root.normalizeBool(opts.kugouEnabled, true)
         var showT = opts.showTranslations === "Off" ? "Off" : "On"
+        var motion = root.normalizeBool(opts.motionEnabled, true)
         // Release a lookup held for the first configure one turn later. The
         // host injects the widget's `bar` before its `settings` (Bar.qml
         // injectProps): an ordinary `settings` change pushes immediately
@@ -431,7 +447,7 @@ Item {
         }
         if (network === root.networkMode && netease === root.neteaseEnabled
                 && lrclib === root.lrclibEnabled && kugou === root.kugouEnabled
-                && showT === root.showTranslations) return
+                && showT === root.showTranslations && motion === root.motionEnabled) return
         var lookupChanged = network !== root.networkMode || netease !== root.neteaseEnabled
             || lrclib !== root.lrclibEnabled || kugou !== root.kugouEnabled
         root.networkMode = network
@@ -439,6 +455,7 @@ Item {
         root.lrclibEnabled = lrclib
         root.kugouEnabled = kugou
         root.showTranslations = showT
+        root.motionEnabled = motion
         if (!lookupChanged) return
         root.clearSearchState()
         root.invalidateCurrentFetch()
@@ -1928,6 +1945,31 @@ Item {
         repeat: false
         onTriggered: root.settleTrack()
     }
+    Timer {
+        id: stageCloseTimer
+        // Player churn between tracks, and the Omarchy media-status poll
+        // (which can report hasMedia:false for a poll), both briefly look
+        // like "no player". Only a gone/Stopped state that survives a settle
+        // and a fresh status poll closes the Stage.
+        interval: 1500
+        repeat: false
+        onTriggered: {
+            var player = root.activePlayer
+            if (player && player.playbackState !== MprisPlaybackState.Stopped) {
+                root.stageClosePending = false
+                return
+            }
+            if (root.stageClosePending) {
+                root.stageClosePending = false
+                root.stageCloseRequested()
+                return
+            }
+            root.stageClosePending = true
+            root.refreshFallbackMediaStatus()
+            restart()
+        }
+    }
+
 
     Timer {
         id: projectionTimer
@@ -2222,6 +2264,7 @@ Item {
         ignoreUnknownSignals: true
         function onPostTrackChanged() { root.scheduleTrackSettle() }
         function onTrackChanged() { root.scheduleTrackSettle() }
+        function onPlaybackStateChanged() { root.scheduleStageCloseCheck() }
         function onIsPlayingChanged() { root.performProjection(true); root.updateProjectionTimer() }
         function onPositionChanged() {
             root.performProjection(false)

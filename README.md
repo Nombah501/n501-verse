@@ -105,6 +105,16 @@ LRCLIB may identify an **Instrumental Track** with no lyrics. This is a ready re
 
 Clips: "Heart On Redial" (CC BY 3.0, see Credits) with a local word-timed `.lrc`, one Omarchy theme per clip.
 
+## The Stage
+
+![The Stage on the matte-black theme: the line "While I practice my hello, hello" fills word by word in the lower third over the dimmed wallpaper, the next line dimmed below it, the bar still visible above](media/stage.png)
+
+Choose **Stage** from the panel's **⋯** menu, or run `omarchy-shell n501.karaoke stage`, to show large synced lyrics over the desktop on the focused monitor. The bar stays usable above it, and clicks and typing go to the windows underneath. The screen is dimmed in your theme's background colour. The active line fills with the song, its translation appears below when Translations is on, and the next line is dimmed. Long lines wrap. Intro and interlude show the same progress trace and draining three-dot countdown as the bar; Pause holds the current position. Motion off keeps the word fill but removes lyric transitions.
+
+When the track has no timed lyrics, Stage shows a title/artist card instead: "Searching…" while lyrics are being found, Unsynced lyrics stay in the panel, an Instrumental Track says "Instrumental", and an unresolved track says "No lyrics". Selecting a timed document replaces the card with the singing view.
+
+Run the same command again to close the Stage. It also closes by itself when the player goes away or stops, but not on pause or when the track changes.
+
 ## The panel
 
 ![The N501 Verse panel: track header with the Word sync badge and progress, Refresh, Search, timing offset and menu, and the lyric list with the active line filling](media/panel.png)
@@ -130,10 +140,11 @@ Left-click the widget to open it: the whole lyric sheet with the active line hig
 
 ### Keyboard shortcut and Omarchy menu
 
-Add this line to `~/.config/hypr/bindings.lua` to toggle the panel (change the key if it is already in use):
+Add these lines to `~/.config/hypr/bindings.lua` to toggle the panel and the Stage (change the keys if they are already in use):
 
 ```lua
 o.bind("SUPER + ALT + L", "N501 Verse lyrics", "omarchy-shell n501.karaoke toggle")
+o.bind("SUPER + ALT + Y", "N501 Verse Stage", "omarchy-shell n501.karaoke stage")
 ```
 
 Add these entries inside `~/.config/omarchy/extensions/omarchy-menu.jsonc`:
@@ -141,10 +152,11 @@ Add these entries inside `~/.config/omarchy/extensions/omarchy-menu.jsonc`:
 ```jsonc
 "personal.lyrics": {"label":"N501 Verse"},
 "personal.lyrics.panel": {"label":"Open lyrics panel","action":"omarchy-shell n501.karaoke open"},
-"personal.lyrics.search": {"label":"Manual Search","action":"omarchy-shell n501.karaoke search"}
+"personal.lyrics.search": {"label":"Manual Search","action":"omarchy-shell n501.karaoke search"},
+"personal.lyrics.stage": {"label":"Stage","action":"omarchy-shell n501.karaoke stage"}
 ```
 
-The IPC target is `n501.karaoke`. `open` shows the lyric panel; `search` opens it in Manual Search with the query focused. These commands require the running shell to have the plugin widget loaded.
+The IPC target is `n501.karaoke`. `omarchy-shell n501.karaoke toggle` opens or closes the lyric panel; `open` shows it, `search` opens it in Manual Search with the query focused, and `stage` opens or closes the Stage. These commands require the running shell to have the plugin widget loaded. `omarchy-shell shell toggle n501.karaoke` now opens or closes the Stage, **not** the panel.
 
 ## Settings
 
@@ -208,7 +220,7 @@ lyrics_core/           Lyrics Core: providers, parsers, matching, cache, offsets
 
 The Lyrics Core is derived from [Kotonoha](https://github.com/locez/kotonoha) by Locez (MIT), at commit `175cfcc`; its license and provenance are in [`lyrics_core/`](lyrics_core/UPSTREAM.md).
 
-Demo media: "Heart On Redial" by Loveshadow, featuring Mana Junkie and Airtone — https://ccmixter.org/files/Loveshadow/26157 — CC BY 3.0 (https://creativecommons.org/licenses/by/3.0/). The theme GIF, the preview, the bar clips and the panel show its lyrics (0:49–3:41) as rendered by the real widget from a local word-timed `.lrc`. The lookup clip shows only a track title and the lookup steps, no lyrics. Backgrounds are the stock wallpapers of the Omarchy tokyo-night, gruvbox, catppuccin, nord, matte-black and catppuccin-latte themes.
+Demo media: "Heart On Redial" by Loveshadow, featuring Mana Junkie and Airtone — https://ccmixter.org/files/Loveshadow/26157 — CC BY 3.0 (https://creativecommons.org/licenses/by/3.0/). The theme GIF, the preview, the bar clips, the panel and the Stage screenshot show its lyrics (0:49–3:41) as rendered by the real widget from a local word-timed `.lrc`. The lookup clip shows only a track title and the lookup steps, no lyrics. Backgrounds are the stock wallpapers of the Omarchy tokyo-night, gruvbox, catppuccin, nord, matte-black and catppuccin-latte themes.
 
 CC BY 3.0 music and lyrics apply only to the demo media, not to the plugin (MIT).
 

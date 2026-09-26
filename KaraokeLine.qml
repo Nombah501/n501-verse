@@ -10,6 +10,8 @@ Item {
     property real position: 0
     property bool wordTiming: false
     property bool playing: true
+    property bool motionEnabled: true
+    property string trackKey: ""
     property bool segmentEnabled: true
     property bool wrapEnabled: false
     property color accent: Color.accent
@@ -41,6 +43,7 @@ Item {
         ? KaraokeModel.activeSegmentIndex(root.line, root.segments, root.position) : 0
     readonly property var currentSegment: root.segments[root.segmentIndex] || null
     property var displayedSegment: null
+    property string displayedTrackKey: ""
     readonly property real fullWidth: root.currentSegment
         ? Math.min(root.width, currentLayer.fullWidth) : 0
 
@@ -52,7 +55,8 @@ Item {
         if (root.displayedSegment === root.currentSegment) return
         fadeOut.stop()
         fadeIn.stop()
-        if (root.playing && root.displayedSegment && root.currentSegment) {
+        if (root.motionEnabled && root.playing && root.displayedSegment
+                && root.currentSegment && root.displayedTrackKey === root.trackKey) {
             previousLayer.segment = root.displayedSegment
             previousLayer.playbackPosition = root.position
             previousLayer.opacity = 1
@@ -64,6 +68,23 @@ Item {
             currentLayer.opacity = 1
         }
         root.displayedSegment = root.currentSegment
+        root.displayedTrackKey = root.trackKey
+    }
+    onTrackKeyChanged: {
+        if (root.trackKey !== root.displayedTrackKey) {
+            fadeOut.stop()
+            fadeIn.stop()
+            previousLayer.opacity = 0
+            currentLayer.opacity = 1
+        }
+    }
+    onMotionEnabledChanged: {
+        if (!root.motionEnabled) {
+            fadeOut.stop()
+            fadeIn.stop()
+            previousLayer.opacity = 0
+            currentLayer.opacity = 1
+        }
     }
     onPlayingChanged: {
         if (!root.playing) {
